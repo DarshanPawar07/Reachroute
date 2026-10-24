@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+
+# secrets: never commit these
+.env
+.env.*
+!.env.example
+
+# build output
+dist/
+build/
+
+# logs and local data
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+coverage/
+
+# editor
+.vscode/
+.idea/
+
+# local databases and backups
+mongo-data/
+backups/
+*.bak

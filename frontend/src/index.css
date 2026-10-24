@@ -1,0 +1,112 @@
+@import "tailwindcss";
+
+/*
+  Colors and fonts for the whole app. The "stone" greys are tuned to a cool green-ink, and "emerald" is the
+  brand teal, so every screen picks the new look up from here.
+*/
+@theme {
+  --font-sans: "Figtree", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-display: "Bricolage Grotesque", "Figtree", ui-sans-serif, system-ui, sans-serif;
+
+  --color-stone-50: #f5f8f7;
+  --color-stone-100: #ebf0ee;
+  --color-stone-200: #dce4e1;
+  --color-stone-300: #c3cfca;
+  --color-stone-400: #93a49e;
+  --color-stone-500: #687a74;
+  --color-stone-600: #4d5f59;
+  --color-stone-700: #384843;
+  --color-stone-800: #23322e;
+  --color-stone-900: #12242d;
+  --color-stone-950: #0b171d;
+
+  --color-emerald-50: #e8f6f3;
+  --color-emerald-100: #c9ece5;
+  --color-emerald-200: #9adbcf;
+  --color-emerald-300: #62c3b3;
+  --color-emerald-400: #33a896;
+  --color-emerald-500: #1a8f7e;
+  --color-emerald-600: #0f7a6c;
+  --color-emerald-700: #0b6358;
+  --color-emerald-800: #0a4f47;
+  --color-emerald-900: #083f39;
+
+  /* the two channels each keep one color everywhere */
+  --color-wa: #1fa463;
+  --color-wa-soft: #e3f5ea;
+  --color-mail: #3b5bdb;
+  --color-mail-soft: #e8edfd;
+}
+
+@layer base {
+  body {
+    background: var(--color-stone-50);
+    color: var(--color-stone-900);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.015em;
+    color: var(--color-stone-900);
+  }
+  a {
+    text-underline-offset: 3px;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-emerald-500);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: var(--color-emerald-100);
+  }
+  input[type='checkbox'],
+  input[type='radio'],
+  input[type='range'] {
+    accent-color: var(--color-emerald-600);
+  }
+  input[type='checkbox'],
+  input[type='radio'] {
+    width: 1rem;
+    height: 1rem;
+    flex-shrink: 0;
+  }
+  input[type='file'] {
+    font-size: 0.875rem;
+    color: var(--color-stone-600);
+  }
+  input[type='file']::file-selector-button {
+    margin-right: 0.75rem;
+    cursor: pointer;
+    border: 1px solid var(--color-stone-300);
+    border-radius: 0.75rem;
+    background: white;
+    padding: 0.5rem 0.9rem;
+    font-weight: 600;
+    color: var(--color-stone-800);
+    transition: background 0.15s;
+  }
+  input[type='file']::file-selector-button:hover {
+    background: var(--color-stone-50);
+  }
+  textarea {
+    line-height: 1.6;
+  }
+  pre {
+    font-family: var(--font-sans);
+  }
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
