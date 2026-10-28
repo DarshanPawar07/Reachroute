@@ -25,7 +25,7 @@ async function emailOwner(userId, alert) {
   await sender.transport.sendMail({
     from: sender.from,
     to: user.email,
-    subject: `[Bulk Messenger] ${alert.title}`,
+    subject: `[Reachroute] ${alert.title}`,
     text: `${alert.message}${link}\n\nYou get this email because alerts are switched on for this app.`,
   });
   await Notification.updateOne({ _id: alert._id }, { $set: { emailed: true } });

@@ -83,9 +83,9 @@ export async function sendSenderCode(userId, { now = Date.now() } = {}) {
   try {
     delivery = await sendSystemEmail({
       to: email,
-      subject: `${code} is your Bulk Messenger verification code`,
+      subject: `${code} is your Reachroute verification code`,
       text:
-        `Your verification code is ${code}\n\nIt works for ${CODE_MINUTES} minutes. Enter it in Bulk Messenger to use ${email} as a sender.\n` +
+        `Your verification code is ${code}\n\nIt works for ${CODE_MINUTES} minutes. Enter it in Reachroute to use ${email} as a sender.\n` +
         'If you did not ask for this, ignore this email: nothing happens without the code.',
     });
   } catch (err) {

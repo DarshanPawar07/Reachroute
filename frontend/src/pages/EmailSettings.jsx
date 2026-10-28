@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
+import ImapSettings from '../components/ImapSettings.jsx';
 import SenderVerify from '../components/SenderVerify.jsx';
 import { Alert, Button, Card, Field, Input, PageHeader, Select } from '../components/ui.jsx';
 
@@ -157,6 +158,10 @@ export default function EmailSettings() {
           </div>
         </form>
       </Card>
+
+      <div className="mt-4">
+        <ImapSettings />
+      </div>
 
       <div className="mt-4">
         <Alert kind="info">

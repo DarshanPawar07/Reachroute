@@ -3,7 +3,9 @@ import { api } from '../api.js';
 import CampaignTable from '../components/CampaignTable.jsx';
 import RestrictionPanel from '../components/RestrictionPanel.jsx';
 import RepliesLink from '../components/RepliesLink.jsx';
+import AllowanceBanner from '../components/AllowanceBanner.jsx';
 import { Alert, Badge, Button, Card, LinkButton, PageHeader } from '../components/ui.jsx';
+import { askConfirm } from '../components/ConfirmDialog.jsx';
 
 export default function WhatsAppHome() {
   const [conn, setConn] = useState({ status: 'disconnected', qr: null });
@@ -42,7 +44,7 @@ export default function WhatsAppHome() {
   };
 
   const disconnect = async () => {
-    if (!window.confirm('Disconnect this WhatsApp account? Running campaigns will pause.')) return;
+    if (!await askConfirm('Disconnect this WhatsApp account? Running campaigns will pause.')) return;
     setBusy(true);
     setError('');
     try {
@@ -72,6 +74,8 @@ export default function WhatsAppHome() {
           </>
         }
       />
+
+      <div className="mb-4"><AllowanceBanner channel="whatsapp" /></div>
 
       <div className="space-y-4">
         <RestrictionPanel connStatus={conn.status} onConnection={setConn} />

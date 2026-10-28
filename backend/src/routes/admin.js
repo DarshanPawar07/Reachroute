@@ -2,9 +2,11 @@ import { Router } from 'express';
 import {
   accountDetail, createPlan, deletePlan, forceLogout, isPlanKey, listPlans, listUsers, markVerified, overview, setUserLimits, setUserPlan, suspendUser, unsuspendUser, updatePlan,
 } from '../admin/accounts.js';
+import { billingSummary, issueCreditNote, listInvoices, listSubscriptions } from '../admin/billing.js';
 import { describeLimits } from '../plans/definitions.js';
 import { fromReq, listAudit, record } from '../audit/audit.js';
 import { requireAdmin } from '../middleware/auth.js';
+import { ContactMessage } from '../models.js';
 import { bad, validId } from '../utils/http.js';
 import { logger } from '../utils/logger.js';
 
@@ -63,13 +65,13 @@ export function adminRouter() {
 
   router.post('/plans', async (req, res) => {
     const plan = await createPlan(req.body || {});
-    await record({ ...fromReq(req), actorEmail: req.adminEmail, action: 'plan.created', detail: `${plan.key} "${plan.name}": ${describeLimits(plan.limits)}` });
+    await record({ ...fromReq(req), actorEmail: req.adminEmail, action: 'plan.created', detail: `${plan.key} "${plan.name}" Rs ${plan.priceMonthly}/mo, Rs ${plan.priceYearly}/yr: ${describeLimits(plan.limits)}` });
     res.status(201).json({ plan });
   });
 
   router.put('/plans/:key', async (req, res) => {
     const plan = await updatePlan(req.params.key, req.body || {});
-    await record({ ...fromReq(req), actorEmail: req.adminEmail, action: 'plan.updated', detail: `${plan.key} "${plan.name}": ${describeLimits(plan.limits)}` });
+    await record({ ...fromReq(req), actorEmail: req.adminEmail, action: 'plan.updated', detail: `${plan.key} "${plan.name}" Rs ${plan.priceMonthly}/mo, Rs ${plan.priceYearly}/yr: ${describeLimits(plan.limits)}` });
     res.json({ plan });
   });
 
@@ -96,6 +98,37 @@ export function adminRouter() {
   router.post('/users/:id/verify-email', async (req, res) => {
     await done(req, 'user.email_verified', await markVerified(req.params.id));
     res.json({ ok: true });
+  });
+
+  // ---- billing: who pays, what was invoiced, refund notes
+  router.get('/billing/summary', async (_req, res) => res.json(await billingSummary()));
+  router.get('/billing/subscriptions', async (req, res) => res.json(await listSubscriptions(req.query)));
+  router.get('/billing/invoices', async (req, res) => res.json(await listInvoices(req.query)));
+  router.post('/billing/invoices/:id/refund-note', async (req, res) => {
+    const result = await issueCreditNote(req.params.id, req.body || {}, req.adminEmail);
+    log.info({ admin: req.userId, invoice: req.params.id, note: result.note.number }, 'refund note issued');
+    await record({
+      ...fromReq(req), actorEmail: req.adminEmail, action: 'billing.refund_note', targetId: result.userId, targetEmail: result.email,
+      detail: `${result.note.number}: Rs ${result.note.amountPaise / 100} on ${result.invoice.number} | ${result.note.reason}`.slice(0, 500),
+    });
+    res.json({ invoice: result.invoice, note: { number: result.note.number } });
+  });
+
+  // ---- messages from the public Contact page
+  router.get('/messages', async (req, res) => {
+    const filter = req.query.handled === 'true' ? { handled: true } : req.query.handled === 'false' ? { handled: false } : {};
+    const [messages, open] = await Promise.all([
+      ContactMessage.find(filter).sort({ createdAt: -1 }).limit(200).select('-ip').lean(),
+      ContactMessage.countDocuments({ handled: false }),
+    ]);
+    res.json({ messages, open });
+  });
+
+  router.post('/messages/:id/handled', async (req, res) => {
+    const handled = req.body?.handled !== false;
+    const msg = await ContactMessage.findByIdAndUpdate(req.params.id, { handled }, { new: true }).select('-ip').lean();
+    if (!msg) throw bad('Not found', 404);
+    res.json({ message: msg });
   });
 
   return router;

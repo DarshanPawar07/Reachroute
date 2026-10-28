@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../api.js';
 import AuthShell from '../components/AuthShell.jsx';
-import { Alert, Card } from '../components/ui.jsx';
+import { Alert } from '../components/ui.jsx';
 
 export default function VerifyEmail() {
   const [params] = useSearchParams();
@@ -21,16 +21,16 @@ export default function VerifyEmail() {
 
   return (
     <AuthShell title="Confirm your email">
-      <Card className="space-y-4">
+      <div className="space-y-4">
         {state.status === 'working' && <p className="text-sm text-stone-600">Confirming...</p>}
         {state.status === 'ok' && <Alert kind="success">Thank you. Your email address is confirmed.</Alert>}
         {state.status === 'error' && <Alert>{state.message}</Alert>}
         {state.status !== 'working' && (
-          <Link to="/" className="inline-block text-sm font-medium underline">
+          <Link to="/dashboard" className="inline-block text-sm font-medium underline">
             Continue to the app
           </Link>
         )}
-      </Card>
+      </div>
     </AuthShell>
   );
 }

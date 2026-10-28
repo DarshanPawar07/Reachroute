@@ -11,6 +11,8 @@ import { requestLog } from './middleware/requestLog.js';
 import { renderMetrics } from './monitoring/ops.js';
 import { attachmentsRouter } from './routes/attachments.js';
 import { accountRouter } from './routes/account.js';
+import { contactRouter } from './routes/contact.js';
+import { oauthRouter } from './routes/oauth.js';
 import { legalApiRouter, legalPagesRouter } from './routes/legal.js';
 import { adminRouter } from './routes/admin.js';
 import { authRouter } from './routes/auth.js';
@@ -26,6 +28,7 @@ import statsRoutes from './routes/stats.js';
 import unsubscribeRoutes from './routes/unsubscribe.js';
 import { imapRouter } from './routes/imap.js';
 import repliesRouter, { emailRepliesRouter } from './routes/replies.js';
+import { billingRouter, billingWebhook, publicPlansRouter } from './routes/billing.js';
 import { whatsappRouter } from './routes/whatsapp.js';
 
 /**
@@ -75,6 +78,9 @@ export function buildApp(limiters, { isDraining = () => false } = {}) {
   // and Amazon SNS labels its JSON as text/plain. The secret in the address says which account it is for.
   app.use('/hooks/email', limiters.webhook, express.json({ limit: '1mb', type: () => true }), hooksRoutes);
 
+  // Public: Razorpay payment notices. The signature is checked against the exact bytes, so no JSON parser before it.
+  app.post('/api/billing/webhook', limiters.webhook, express.raw({ type: () => true, limit: '1mb' }), billingWebhook());
+
   app.use(express.json({ limit: '100kb' }));
   app.use(express.urlencoded({ extended: false, limit: '10kb' })); // one-click unsubscribe posts a small form
 
@@ -86,13 +92,17 @@ export function buildApp(limiters, { isDraining = () => false } = {}) {
     res.set('Cache-Control', 'no-store');
     next();
   });
+  app.use('/api/auth/oauth', oauthRouter(limiters)); // public: Google / GitHub sign-in
   app.use('/api/auth', authRouter(limiters));
   app.use('/api/legal', legalApiRouter()); // public: the Terms and Privacy Policy
+  app.use('/api/plans', publicPlansRouter()); // public: prices and limits for the pricing page
+  app.use('/api/contact', limiters.contact, contactRouter()); // public: the Contact page form
 
   // Everything below needs a logged-in user and is rate limited per user.
   app.use('/api', requireAuth, limiters.api);
   app.use('/api/admin', adminRouter());
   app.use('/api/account', accountRouter());
+  app.use('/api/billing', billingRouter());
   app.use('/api/dashboard', dashboardRoutes);
   app.use('/api/stats', statsRoutes);
   app.use('/api/notifications', notificationRoutes);

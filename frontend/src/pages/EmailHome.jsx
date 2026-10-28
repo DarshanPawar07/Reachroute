@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import CampaignTable from '../components/CampaignTable.jsx';
+import AllowanceBanner from '../components/AllowanceBanner.jsx';
 import { Alert, Badge, Card, LinkButton, PageHeader } from '../components/ui.jsx';
 
 export default function EmailHome() {
@@ -31,6 +32,7 @@ export default function EmailHome() {
       />
 
       <div className="space-y-4">
+        <AllowanceBanner channel="email" />
         {error && <Alert>{error}</Alert>}
 
         <Card>

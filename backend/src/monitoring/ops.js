@@ -124,7 +124,7 @@ async function defaultNotifyOps(problem) {
   for (const to of config.opsAlertEmails) {
     await sendSystemEmail({
       to,
-      subject: `[Bulk Messenger ops] ${problem.key}`,
+      subject: `[Reachroute ops] ${problem.key}`,
       text: `${problem.message}\n\nInstance: ${config.instanceId}\nEnvironment: ${config.env}\n\nThis alert is sent once per problem (at most every 30 minutes) even when several instances notice it.`,
     });
   }

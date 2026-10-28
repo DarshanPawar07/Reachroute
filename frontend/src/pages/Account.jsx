@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { useAuth } from '../auth.jsx';
 import { fmtSize } from '../lib/kinds.js';
 import { Alert, Button, Card, Field, Input, PageHeader } from '../components/ui.jsx';
+import { askConfirm } from '../components/ConfirmDialog.jsx';
 
 function ChangePassword() {
   const { replaceToken } = useAuth();
@@ -63,7 +65,7 @@ function SignOutEverywhere() {
   const [done, setDone] = useState(false);
 
   const run = async () => {
-    if (!window.confirm('Sign out of every other browser and device? You stay signed in here.')) return;
+    if (!await askConfirm('Sign out of every other browser and device? You stay signed in here.')) return;
     setBusy(true);
     setError('');
     setDone(false);
@@ -104,7 +106,10 @@ function PlanAndStorage() {
   const { usage } = data;
   return (
     <Card className="space-y-3">
-      <h2 className="text-lg font-semibold">Your plan: {data.plan.name}</h2>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-lg font-semibold">Your plan: {data.plan.name}</h2>
+        <Link to="/billing" className="text-sm font-semibold text-emerald-700 underline">Plan and billing</Link>
+      </div>
       <p className="text-sm text-stone-600">
         Saved: {usage.lists} contact list{usage.lists === 1 ? '' : 's'}, {usage.templates} template{usage.templates === 1 ? '' : 's'}, {usage.attachments} attachment
         {usage.attachments === 1 ? '' : 's'} ({fmtSize(usage.storageBytes)}).
@@ -114,7 +119,7 @@ function PlanAndStorage() {
           {data.limits.map((l) => (
             <tr key={l.key}>
               <td className="py-1.5 pr-3">{l.label}</td>
-              <td className="py-1.5 pr-3 font-medium tabular-nums">{l.value}</td>
+              <td className="py-1.5 pr-3 font-medium tabular-nums">{l.value === 0 ? 'no limit' : l.value}</td>
               <td className="py-1.5 text-xs text-stone-500">{l.source === 'account' ? 'set for your account' : l.source === 'plan' ? 'from your plan' : 'standard'}</td>
             </tr>
           ))}

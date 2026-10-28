@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../api.js';
 import { KINDS, fmtDate } from '../lib/kinds.js';
 import { Alert, Button, Card, Field, PageHeader, Select } from '../components/ui.jsx';
+import { askConfirm } from '../components/ConfirmDialog.jsx';
 
 /** Replies to campaigns. The same page serves WhatsApp and email; only the address field and the A/B tag differ. */
 export default function Replies({ kind }) {
@@ -77,7 +78,7 @@ export default function Replies({ kind }) {
   };
 
   const remove = async (id) => {
-    if (!window.confirm('Delete this reply? It cannot be brought back.')) return;
+    if (!await askConfirm('Delete this reply? It cannot be brought back.')) return;
     try {
       const res = await api(`${apiBase}/${id}`, { method: 'DELETE' });
       setUnread(res.unread);

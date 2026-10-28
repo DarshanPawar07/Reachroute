@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { fromReq, record } from '../audit/audit.js';
 import { config } from '../config.js';
 import { getSender, invalidateSender } from '../email/mailer.js';
+import { sendTestEmail } from '../email/testSend.js';
 import { senderStatus, sendSenderCode, verifySenderCode } from '../email/senderVerification.js';
 import { emailChannel, emailEngine } from '../engine/channels.js';
 import { SmtpSettings, User } from '../models.js';
@@ -28,8 +29,8 @@ const PROVIDERS = [
   { name: 'Amazon SES', host: 'email-smtp.ap-south-1.amazonaws.com', port: 587, secure: false, note: 'Use your SES SMTP credentials. Change the region in the host to match yours. The sender must be verified in SES.' },
 ];
 
-/** `limiters` = { createCampaign, smtpTest, settingsWrite, senderOtp } (all optional). */
-export function emailRouter({ createCampaign, smtpTest, settingsWrite, senderOtp } = {}) {
+/** `limiters` = { createCampaign, smtpTest, settingsWrite, senderOtp, testSend } (all optional). */
+export function emailRouter({ createCampaign, smtpTest, settingsWrite, senderOtp, testSend } = {}) {
   const router = Router();
   const use = (limiter) => (limiter ? [limiter] : []);
 
@@ -140,7 +141,7 @@ export function emailRouter({ createCampaign, smtpTest, settingsWrite, senderOtp
         from: sender.from,
         replyTo: sender.replyTo,
         to: account.email,
-        subject: 'Test email from Bulk Messenger',
+        subject: 'Test email from Reachroute',
         text: 'Your SMTP settings work. You can now send email campaigns.',
       });
     } catch (err) {
@@ -151,6 +152,10 @@ export function emailRouter({ createCampaign, smtpTest, settingsWrite, senderOtp
   });
 
   // ------------------------------------------------------------------ campaigns
+  // Preview: the campaign as written, sent to the account's own address. Declared before the campaigns router.
+  router.post('/campaigns/test', ...use(testSend), async (req, res) => {
+    res.json({ ok: true, ...(await sendTestEmail(req.userId, req.body || {})) });
+  });
   router.use('/campaigns', campaignRouter(emailChannel, emailEngine, { createLimiter: createCampaign }));
 
   return router;

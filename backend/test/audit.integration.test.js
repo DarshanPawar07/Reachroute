@@ -9,7 +9,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const URI = process.env.TEST_MONGO_URI;
 if (URI && !/test/i.test(URI)) throw new Error('TEST_MONGO_URI must contain "test"');
 const skip = URI ? false : 'set TEST_MONGO_URI to a throw-away database to run these tests';
-delete process.env.SMTP_HOST;
+process.env.SMTP_HOST = ''; // empty, not deleted: a real .env would otherwise fill it back in
 process.env.ALERT_EMAILS = 'false';
 
 const mongoose = (await import('mongoose')).default;
@@ -219,7 +219,7 @@ test('a locked account and a blocked suspended login are recorded', T, async () 
   const admin = await newUser({ admin: true });
   const u = await newUser();
   await User.updateOne({ _id: u.id }, { $set: { failedLogins: 7 } });
-  assert.equal((await call('POST', '/api/auth/login', { json: { email: u.email, password: 'wrong password here' } })).status, 401);
+  assert.equal((await call('POST', '/api/auth/login', { json: { email: u.email, password: 'wrong password here' } })).status, 429, 'the wrong password that locks the account says so');
   assert.deepEqual((await entriesFor(`actor=${u.id}`, admin.token)).body.entries.map((e) => [e.action, e.detail]), [['login.locked', 'after 8 wrong passwords']]);
 
   const s = await newUser();

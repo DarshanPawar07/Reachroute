@@ -6,6 +6,7 @@ import { Alert, Badge, Button, Card, Field, Input, Select, Stat } from '../../co
 import { fmtDate } from '../../lib/kinds.js';
 import { cleanLimits, useLimitDefs } from '../../lib/limits.js';
 import AdminTabs from './AdminTabs.jsx';
+import { askConfirm } from '../../components/ConfirmDialog.jsx';
 
 function ChannelUsage({ title, u }) {
   return (
@@ -57,7 +58,7 @@ export default function AdminUserDetail() {
   }, [load]);
 
   const run = async (path, { method = 'POST', body, ok, confirm } = {}) => {
-    if (confirm && !window.confirm(confirm)) return;
+    if (confirm && !await askConfirm(confirm)) return;
     setBusy(true);
     setNote(null);
     try {

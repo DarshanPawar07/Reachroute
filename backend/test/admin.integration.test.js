@@ -9,7 +9,7 @@ import http from 'node:http';
 const URI = process.env.TEST_MONGO_URI;
 if (URI && !/test/i.test(URI)) throw new Error('TEST_MONGO_URI must contain "test"');
 const skip = URI ? false : 'set TEST_MONGO_URI to a throw-away database to run these tests';
-delete process.env.SMTP_HOST;
+process.env.SMTP_HOST = ''; // empty, not deleted: a real .env would otherwise fill it back in
 process.env.ALERT_EMAILS = 'false';
 
 const mongoose = (await import('mongoose')).default;
@@ -228,7 +228,7 @@ test('suspending: signed out, cannot log in, campaigns paused, nothing deleted; 
   assert.equal(blocked.status, 403);
   assert.match(blocked.body.error, /suspended/);
   assert.equal((await login(u.email, 'wrong password here')).status, 401, 'a wrong password reveals nothing');
-  assert.equal((await login(`never.${tag}@example.com`)).status, 401);
+  assert.equal((await login(`never.${tag}@example.com`)).status, 404, 'login says when there is no such account');
 
   const paused = await Campaign.findById(campaign._id).lean();
   assert.equal(paused.status, 'paused');

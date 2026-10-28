@@ -1,3 +1,4 @@
+import { config } from '../config.js';
 import { emailEngine, whatsappEngine } from '../engine/channels.js';
 import { forgetUser } from '../middleware/auth.js';
 import { describeLimits, onlyLimits, platformLimits, readLimits } from '../plans/definitions.js';
@@ -207,6 +208,11 @@ const planRow = (plan, users) => ({
   key: plan.key,
   name: plan.name,
   builtIn: false,
+  tagline: plan.tagline || '',
+  priceMonthly: plan.priceMonthly || 0,
+  priceYearly: plan.priceYearly || 0,
+  listed: plan.listed !== false,
+  sortOrder: plan.sortOrder ?? 100,
   limits: onlyLimits(plan.limits), // only what the plan sets; the rest comes from the platform defaults
   effective: { ...platformLimits(), ...onlyLimits(plan.limits) },
   users,
@@ -235,11 +241,31 @@ function readPlanName(value) {
   return name;
 }
 
-export async function createPlan({ key, name, limits }) {
+const readPrice = (v, label) => {
+  const n = Number(v ?? 0);
+  if (!Number.isInteger(n) || n < 0 || n > 10_000_000) throw bad(`${label} must be a whole number of rupees, 0 or more`);
+  return n;
+};
+/** The optional plan details (prices, tagline, visibility, order) that were sent. */
+function readExtras(b) {
+  const out = {};
+  if (b.priceMonthly !== undefined) out.priceMonthly = readPrice(b.priceMonthly, 'The monthly price');
+  if (b.priceYearly !== undefined) out.priceYearly = readPrice(b.priceYearly, 'The yearly price');
+  if (b.tagline !== undefined) out.tagline = String(b.tagline ?? '').trim().slice(0, 140);
+  if (b.listed !== undefined) out.listed = b.listed === true;
+  if (b.sortOrder !== undefined) {
+    const n = Number(b.sortOrder);
+    if (!Number.isInteger(n) || n < 0 || n > 10_000) throw bad('The order must be a whole number from 0 to 10000');
+    out.sortOrder = n;
+  }
+  return out;
+}
+
+export async function createPlan({ key, name, limits, ...extras }) {
   const k = String(key ?? '').trim().toLowerCase();
   if (k === 'default') throw bad('"default" is the built-in plan and cannot be changed. Choose another key.');
   if (!PLAN_KEY.test(k)) throw bad('The plan key must be 2 to 30 characters: lowercase letters, numbers and hyphens, starting with a letter or number');
-  const doc = { key: k, name: readPlanName(name), limits: readLimits(limits) };
+  const doc = { key: k, name: readPlanName(name), limits: readLimits(limits), ...readExtras(extras) };
   try {
     const plan = await Plan.create(doc);
     return planRow(plan.toObject(), 0);
@@ -250,9 +276,10 @@ export async function createPlan({ key, name, limits }) {
 }
 
 /** Change a plan's name and/or its limits (the limits you send replace the old ones). Everyone on the plan gets the change. */
-export async function updatePlan(key, { name, limits }) {
-  if (name === undefined && limits === undefined) throw bad('Send a name, limits, or both');
-  const set = {};
+export async function updatePlan(key, { name, limits, ...extras }) {
+  const more = readExtras(extras);
+  if (name === undefined && limits === undefined && !Object.keys(more).length) throw bad('Send something to change');
+  const set = { ...more };
   if (name !== undefined) set.name = readPlanName(name);
   if (limits !== undefined) set.limits = readLimits(limits);
   const plan = await Plan.findOneAndUpdate({ key }, { $set: set }, { returnDocument: 'after' }).lean();
@@ -265,6 +292,7 @@ export async function updatePlan(key, { name, limits }) {
 export async function deletePlan(key) {
   const plan = await Plan.findOne({ key }).lean();
   if (!plan) throw bad('No plan with that key', 404);
+  if (key === config.defaultPlanKey) throw bad('New accounts start on this plan (DEFAULT_PLAN_KEY). Change that setting first.', 409);
   const users = await count(User.countDocuments({ planKey: key }));
   if (users) throw bad(`${users} account${users === 1 ? ' is' : 's are'} on this plan. Move them to another plan first.`, 409);
   await Plan.deleteOne({ key });

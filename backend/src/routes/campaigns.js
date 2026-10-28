@@ -33,7 +33,10 @@ async function claimFromList(req, channel, engine, atMs) {
 
   const onlyNew = !isFalse(req.body.onlyNew);
   const remaining = await engine.remainingToday(req.userId, atMs);
-  if (remaining === 0) throw bad(`You have used today's limit of ${channel.limits.dailyCap}. Try again later.`, 429);
+  if (remaining === 0) {
+    await engine.checkQuota?.(req.userId, 1); // the plan's totals say it better when they are what ran out
+    throw bad(`You have used today's limit of ${channel.limits.dailyCap}. Try again later.`, 429);
+  }
 
   let take = remaining;
   let capped = false;
@@ -44,9 +47,11 @@ async function claimFromList(req, channel, engine, atMs) {
     capped = wanted > remaining;
   }
 
-  const filter = { listId: list._id, ...(onlyNew ? { lastCampaignAt: null } : {}) };
+  const group = typeof req.body.group === 'string' ? req.body.group.trim().toLowerCase() : '';
+  const filter = { listId: list._id, ...(group ? { groups: group } : {}), ...(onlyNew ? { lastCampaignAt: null } : {}) };
   const picked = await ListContact.find(filter).sort({ _id: 1 }).limit(take).select('_id').lean();
   if (!picked.length) {
+    if (group) throw bad(onlyNew ? `Everyone in the group "${group}" has already been messaged, or the group has nobody in it.` : `Nobody is in the group "${group}".`);
     throw bad(
       onlyNew
         ? 'Everyone in this list has already been messaged. Add new contacts, or untick "only people not messaged yet".'
@@ -105,6 +110,66 @@ async function variantResults(Recipient, campaignId) {
     if (k.f === 'unsubscribed') v.unsubscribed += n;
   }
   return out;
+}
+
+/**
+ * Who of a finished campaign can be sent to again, in a new campaign:
+ *   failed       the message did not go out (not those that may have been delivered anyway)
+ *   maybe        failed, but it may have been delivered (a timeout at the wrong moment)
+ *   unsent       never tried, because the campaign was cancelled
+ * Other "skipped" people (opted out, not on WhatsApp, your own number) are left out on purpose.
+ */
+const RESENDABLE = {
+  failed: { status: 'failed', ambiguous: { $ne: true } },
+  maybe: { status: 'failed', ambiguous: true },
+  unsent: { status: 'skipped', error: 'cancelled' },
+};
+// WhatsApp only: accepted by WhatsApp but the contact's phone never confirmed it, even many hours later.
+const UNDELIVERED_AFTER_MS = 6 * 60 * 60_000;
+const undelivered = () => ({ status: 'sent', waMessageId: { $type: 'string' }, deliveredAt: null, sentAt: { $lte: new Date(Date.now() - UNDELIVERED_AFTER_MS) } });
+const resendFilters = (channelName) => ({ ...RESENDABLE, ...(channelName === 'whatsapp' ? { undelivered: undelivered() } : {}) });
+
+async function resendableCounts(Recipient, campaignId, channelName) {
+  const entries = await Promise.all(Object.entries(resendFilters(channelName)).map(async ([k, filter]) => [k, await Recipient.countDocuments({ campaignId, ...filter })]));
+  return Object.fromEntries(entries);
+}
+
+// WhatsApp: of the messages WhatsApp accepted, how many reached the contact's phone, and how many were opened.
+// `waiting` = no confirmation yet, but it has been under 15 minutes (phones can be off for a while); `notDelivered` = longer than that.
+const GRACE_MS = 15 * 60_000;
+async function deliveryStats(Recipient, campaignId) {
+  const [row] = await Recipient.aggregate([
+    { $match: { campaignId, status: 'sent' } },
+    {
+      $group: {
+        _id: null,
+        sent: { $sum: 1 },
+        tracked: { $sum: { $cond: [{ $eq: [{ $type: '$waMessageId' }, 'string'] }, 1, 0] } },
+        delivered: { $sum: { $cond: [{ $eq: [{ $type: '$deliveredAt' }, 'date'] }, 1, 0] } },
+        read: { $sum: { $cond: [{ $eq: [{ $type: '$readAt' }, 'date'] }, 1, 0] } },
+        notDelivered: {
+          $sum: {
+            $cond: [
+              { $and: [{ $eq: [{ $type: '$waMessageId' }, 'string'] }, { $ne: [{ $type: '$deliveredAt' }, 'date'] }, { $lte: ['$sentAt', new Date(Date.now() - GRACE_MS)] }] },
+              1,
+              0,
+            ],
+          },
+        },
+      },
+    },
+  ]);
+  const r = row || { sent: 0, tracked: 0, delivered: 0, read: 0, notDelivered: 0 };
+  return { tracked: r.tracked, delivered: r.delivered, read: r.read, notDelivered: r.notDelivered, waiting: Math.max(0, r.tracked - r.delivered - r.notDelivered) };
+}
+
+// One word for a row in the report: read, delivered, not delivered, or "sent" while it is too early to tell (or before tracking existed).
+function deliveryLabel(r) {
+  if (r.status !== 'sent') return '';
+  if (!r.waMessageId) return '';
+  if (r.readAt) return 'read';
+  if (r.deliveredAt) return 'delivered';
+  return r.sentAt && Date.now() - new Date(r.sentAt).getTime() > GRACE_MS ? 'not delivered' : 'sent';
 }
 
 export function campaignRouter(channel, engine, { createLimiter } = {}) {
@@ -188,13 +253,18 @@ export function campaignRouter(channel, engine, { createLimiter } = {}) {
     const recipients = await Recipient.find({ campaignId: campaign._id })
       .sort({ createdAt: 1, _id: 1 })
       .limit(1000)
-      .select(`name ${contactField} status error ambiguous sentAt feedback variant`)
+      .select(`name ${contactField} status error ambiguous sentAt feedback variant${channel.name === 'whatsapp' ? ' waMessageId deliveredAt readAt' : ''}`)
       .lean();
+    if (channel.name === 'whatsapp') {
+      campaign.delivery = await deliveryStats(Recipient, campaign._id);
+      for (const r of recipients) r.delivery = deliveryLabel(r) || null;
+    }
     // Email: what happened after delivery (bounced later, reported spam, unsubscribed). Empty for WhatsApp.
     const after = await Recipient.aggregate([{ $match: { campaignId: campaign._id, feedback: { $ne: null } } }, { $group: { _id: '$feedback', n: { $sum: 1 } } }]);
     campaign.feedback = Object.fromEntries(after.map((r) => [r._id, r.n]));
     const next = await Recipient.findOne({ campaignId: campaign._id, status: 'pending', scheduledFor: { $ne: null } }).sort({ scheduledFor: 1 }).select('scheduledFor').lean();
     campaign.nextSendAt = campaign.status === 'running' && next ? next.scheduledFor : null; // when the next message goes out
+    if (['completed', 'cancelled'].includes(campaign.status)) campaign.resendable = await resendableCounts(Recipient, campaign._id, channel.name); // who could get it again
     if (campaign.subjectB) campaign.variants = await variantResults(Recipient, campaign._id); // A/B test: how each subject line did
     // Replies: how many people wrote back, and (for A/B) which subject line they were answering.
     const replies = await channel.Reply.aggregate([{ $match: { userId: campaign.userId, campaignId: campaign._id } }, { $group: { _id: { v: '$variant', o: '$optOut' }, n: { $sum: 1 }, people: { $addToSet: '$recipientId' } } }]);
@@ -216,7 +286,7 @@ export function campaignRouter(channel, engine, { createLimiter } = {}) {
     if (!campaign) throw bad('Campaign not found', 404);
     const isEmail = channel.name === 'email';
     const label = { sent: 'sent', failed: 'failed', skipped: 'skipped', pending: 'waiting', sending: 'sending' };
-    const head = ['Name', contactField === 'phone' ? 'Phone' : 'Email', 'Status', 'Detail', 'Sent at', ...(isEmail ? ['After delivery'] : []), ...(campaign.subjectB ? ['Subject version'] : [])];
+    const head = ['Name', contactField === 'phone' ? 'Phone' : 'Email', 'Status', 'Detail', 'Sent at', ...(isEmail ? [] : ['Delivery', 'Delivered at', 'Read at']), ...(isEmail ? ['After delivery'] : []), ...(campaign.subjectB ? ['Subject version'] : [])];
 
     res.set({
       'Content-Type': 'text/csv; charset=utf-8',
@@ -225,11 +295,11 @@ export function campaignRouter(channel, engine, { createLimiter } = {}) {
       'X-Content-Type-Options': 'nosniff',
     });
     res.write('\uFEFF' + csvLine(head)); // the mark lets Excel read names in any language correctly
-    const cursor = Recipient.find({ campaignId: campaign._id }).sort({ createdAt: 1, _id: 1 }).select(`name ${contactField} status error ambiguous sentAt feedback variant`).lean().cursor();
+    const cursor = Recipient.find({ campaignId: campaign._id }).sort({ createdAt: 1, _id: 1 }).select(`name ${contactField} status error ambiguous sentAt feedback variant${isEmail ? '' : ' waMessageId deliveredAt readAt'}`).lean().cursor();
     try {
       for await (const r of cursor) {
         const detail = r.error || (r.ambiguous ? 'may have been delivered' : '');
-        const ok = res.write(csvLine([r.name, r[contactField], label[r.status] || r.status, detail, r.sentAt, ...(isEmail ? [r.feedback] : []), ...(campaign.subjectB ? [r.variant] : [])]));
+        const ok = res.write(csvLine([r.name, r[contactField], label[r.status] || r.status, detail, r.sentAt, ...(isEmail ? [] : [deliveryLabel(r), r.deliveredAt, r.readAt]), ...(isEmail ? [r.feedback] : []), ...(campaign.subjectB ? [r.variant] : [])]));
         if (!ok) await new Promise((resolve) => res.once('drain', resolve)); // do not pile up memory for a slow download
       }
       res.end();
@@ -254,6 +324,64 @@ export function campaignRouter(channel, engine, { createLimiter } = {}) {
     await channel.requireReady(req.userId);
     const includeAmbiguous = req.body?.includeAmbiguous === true;
     res.json({ campaign: await engine.retryFailed(req.userId, req.params.id, { includeAmbiguous }) });
+  });
+
+  // Send a finished campaign again, as a NEW campaign, to the people it did not reach.
+  // Body: who = "failed" | "unsent" | "both" (default "both"), includeMaybeDelivered (true/false), name (optional),
+  // and the usual schedule fields (startAt, windowStart, ...). The message and attachments are copied from the original.
+  router.post('/:id/resend', async (req, res) => {
+    const source = await Campaign.findOne({ _id: req.params.id, userId: req.userId }).lean();
+    if (!source) throw bad('Campaign not found', 404);
+    if (!['completed', 'cancelled'].includes(source.status)) {
+      throw bad('Send again is for finished campaigns. While this one is running, use "Retry failed" instead.', 409);
+    }
+
+    const who = req.body?.who ?? 'both';
+    if (!['failed', 'unsent', 'both', 'none'].includes(who)) throw bad('Choose who to send to: failed, unsent or both.');
+    const filters = resendFilters(channel.name);
+    // "none" = only the people picked with includeUndelivered (WhatsApp: the phone never confirmed the message).
+    const withFailed = who === 'failed' || who === 'both';
+    const groups = [
+      ...(withFailed ? ['failed'] : []),
+      ...(who === 'unsent' || who === 'both' ? ['unsent'] : []),
+      ...(isTrue(req.body?.includeMaybeDelivered) && withFailed ? ['maybe'] : []),
+      ...(isTrue(req.body?.includeUndelivered) && filters.undelivered ? ['undelivered'] : []),
+    ];
+    if (!groups.length) throw bad('Choose who to send to.');
+    const when = readSchedule(req.body ?? {}, { maxDays: config.maxScheduleDays });
+
+    await assertVerified(req.userId);
+    await assertAcceptedTerms(req.userId);
+    await channel.requireReady(req.userId);
+
+    const rows = await Recipient.find({ campaignId: source._id, $or: groups.map((g) => filters[g]) })
+      .sort({ createdAt: 1, _id: 1 })
+      .select(`name ${contactField} fields`)
+      .lean();
+    if (!rows.length) throw bad('There is nobody to send to again. Everyone either received it or cannot be messaged.');
+    const contacts = rows.map((r) => ({ name: r.name, [contactField]: r[contactField], ...(r.fields ? { fields: r.fields } : {}) }));
+
+    // People may have unsubscribed since the first round.
+    const { allowed, skipped } = await channel.filterOptOuts(req.userId, contacts);
+    if (!allowed.length) throw bad('Everyone left has opted out since, so there is nobody to send to.');
+
+    const fields = channel.contentOf(source);
+    if (typeof req.body?.name === 'string' && req.body.name.trim()) fields.name = req.body.name.trim().slice(0, 100);
+    else fields.name = `${source.name} (again)`.slice(0, 100);
+    const { limits: own } = await resolveLimits(req.userId);
+    try {
+      fields.attachments = await resolveForCampaign(req.userId, (source.attachments || []).map((a) => String(a.attachmentId)), channel.name, own);
+    } catch (err) {
+      if (err.status === 404) throw bad('A file attached to the original campaign was deleted. Start a new campaign and attach it again.', 409);
+      throw err;
+    }
+
+    const problems = checkTemplate(channel.templateTexts(fields), columnsOf(allowed));
+    if (problems.length) throw bad(problems.join(' '));
+
+    const campaign = await engine.createCampaign({ userId: req.userId, fields, contacts: allowed, startAt: when.startAt ?? null, sendWindow: when.sendWindow ?? null });
+    await markUsed(fields.attachments).catch(() => {});
+    res.status(201).json({ campaign, summary: { queued: allowed.length, optedOutSkipped: skipped, from: { id: source._id, name: source.name } } });
   });
 
   return router;

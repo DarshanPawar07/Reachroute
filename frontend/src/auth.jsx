@@ -15,11 +15,26 @@ export function AuthProvider({ children }) {
     setSession({ token: data.token, email: data.user.email });
   };
 
-  const login = async (email, password) =>
-    finish(await api('/api/auth/login', { method: 'POST', body: { email, password } }));
+  // With { defer: true } the person is not signed in yet: the page gets the answer and calls completeLogin() later
+  // (used while they still have to type the code from the sign-up email).
+  const login = async (email, password, { defer = false } = {}) => {
+    const data = await api('/api/auth/login', { method: 'POST', body: { email, password } });
+    if (!defer) finish(data);
+    return data;
+  };
 
-  const register = async (email, password, acceptTerms = false) =>
-    finish(await api('/api/auth/register', { method: 'POST', body: { email, password, acceptTerms } }));
+  const register = async (email, password, acceptTerms = false, { defer = false } = {}) => {
+    const data = await api('/api/auth/register', { method: 'POST', body: { email, password, acceptTerms } });
+    if (!defer) finish(data);
+    return data;
+  };
+
+  /** Finish a sign-in that was deferred, or one that came back from Google / GitHub ({ token, email }). */
+  const completeLogin = ({ token, email }) => {
+    localStorage.setItem('token', token);
+    localStorage.setItem('email', email);
+    setSession({ token, email });
+  };
 
   // After a password change or "sign out other devices" the server hands this device a fresh token.
   const replaceToken = (token) => {
@@ -33,7 +48,7 @@ export function AuthProvider({ children }) {
     setSession(null);
   };
 
-  return <AuthContext.Provider value={{ session, login, register, logout, replaceToken }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={{ session, login, register, completeLogin, logout, replaceToken }}>{children}</AuthContext.Provider>;
 }
 
 export const useAuth = () => useContext(AuthContext);

@@ -19,6 +19,10 @@ export const LIMITS = {
   waAttachmentMb: { label: 'Largest WhatsApp attachment (MB)', max: 100, platform: () => config.waAttachmentMb },
   emailAttachmentMb: { label: 'Largest email attachment (MB)', max: 25, platform: () => config.emailAttachmentMb },
   storageMb: { label: 'Attachment storage (MB)', max: 100_000, platform: () => config.attachmentStorageMb },
+  // Totals. A platform value of 0 means "no limit".
+  waLifetimeCap: { label: 'WhatsApp messages in total, ever (does not refill)', max: 100_000_000, platform: () => 0 },
+  emailLifetimeCap: { label: 'Emails in total, ever (does not refill)', max: 100_000_000, platform: () => 0 },
+  monthlyCap: { label: 'Messages per month (WhatsApp and email together, rolling 30 days)', max: 100_000_000, platform: () => 0 },
 };
 
 export const LIMIT_KEYS = Object.keys(LIMITS);

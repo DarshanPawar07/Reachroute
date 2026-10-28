@@ -68,7 +68,7 @@ export const config = {
   // New accounts must tick "I accept the Terms and Privacy Policy", and nobody starts a campaign until they accepted the current versions.
   requireTermsAcceptance: bool('REQUIRE_TERMS_ACCEPTANCE', process.env.NODE_ENV !== 'test'), // on by default; the test runner (NODE_ENV=test) starts with it off
   // Who runs the service, as written in the Terms and Privacy Policy, and where people can write to you about their data.
-  legalName: process.env.LEGAL_OPERATOR_NAME || 'Bulk Messenger',
+  legalName: process.env.LEGAL_OPERATOR_NAME || 'Reachroute',
   legalContactEmail: process.env.LEGAL_CONTACT_EMAIL || '',
   // Where `npm run backup` writes, and how many backups it keeps.
   backupDir: process.env.BACKUP_DIR || 'backups',
@@ -88,6 +88,38 @@ export const config = {
   // Needs a platform SMTP (SMTP_HOST) so verification emails can actually be sent.
   requireEmailVerification: bool('REQUIRE_EMAIL_VERIFICATION', false),
 
+  // ---- plans and billing ----
+  // The plan every new account starts on (a plan key made in Admin > Plans). Empty = new accounts use the platform defaults.
+  defaultPlanKey: (process.env.DEFAULT_PLAN_KEY ?? 'free').trim().toLowerCase(),
+  // Razorpay recurring billing. Payments are switched on only when both the key id and the key secret are set.
+  // The webhook secret is the one typed into Razorpay > Settings > Webhooks; the address to give it is PUBLIC_URL + /api/billing/webhook
+  razorpay: {
+    keyId: process.env.RAZORPAY_KEY_ID || '',
+    keySecret: process.env.RAZORPAY_KEY_SECRET || '',
+    webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || '',
+  },
+  // The invoice a customer gets after each payment. With GST_RATE=0 (not registered for GST) it is a plain invoice without tax.
+  // Prices are treated as GST-INCLUSIVE: with GST_RATE=18 a Rs 699 payment is shown as 592.37 + 106.63 GST. Ask your CA for the rate, the SAC code and the place-of-supply rules.
+  invoice: {
+    sellerName: process.env.INVOICE_SELLER_NAME || process.env.LEGAL_OPERATOR_NAME || 'Reachroute',
+    sellerAddress: process.env.INVOICE_SELLER_ADDRESS || '',
+    sellerState: process.env.INVOICE_SELLER_STATE || '',
+    gstin: (process.env.INVOICE_GSTIN || '').trim().toUpperCase(),
+    gstRate: Number(process.env.GST_RATE || 0),
+    sac: process.env.INVOICE_SAC || '',
+    prefix: (process.env.INVOICE_PREFIX || 'RR').toUpperCase(),
+  },
+  refundWindowDays: int('REFUND_WINDOW_DAYS', 7, { min: 0, max: 90 }),
+  // Days a paid account keeps its plan after a renewal payment is overdue, before it goes back to the default plan.
+  billingGraceDays: int('BILLING_GRACE_DAYS', 3, { min: 0, max: 30 }),
+
+  // Sign in with Google / GitHub. A button only appears when both the id and the secret are set.
+  // The address to register with each provider is PUBLIC_URL + /api/auth/oauth/<google|github>/callback
+  oauth: {
+    google: { clientId: process.env.GOOGLE_CLIENT_ID || '', clientSecret: process.env.GOOGLE_CLIENT_SECRET || '' },
+    github: { clientId: process.env.GITHUB_CLIENT_ID || '', clientSecret: process.env.GITHUB_CLIENT_SECRET || '' },
+  },
+
   // ---- WhatsApp ----
   maxContactsPerUpload: int('MAX_CONTACTS_PER_UPLOAD', 100, { min: 1 }),
   dailyCap: int('DAILY_CAP_PER_ACCOUNT', 100, { min: 1 }),
@@ -102,6 +134,14 @@ export const config = {
   waHealthCheckMinutes: int('WA_HEALTH_CHECK_MINUTES', 15, { min: 0 }),
   // When an account's health is "risk", pause its running campaigns (once a day) to protect the number.
   waHealthAutopause: bool('WA_HEALTH_AUTOPAUSE', true),
+  // Messages WhatsApp accepted but the contact's phone never confirmed (the "Waiting for this message" case). Checked every few minutes
+  // while a campaign runs; when nothing is getting through, the campaign pauses. 0 = never check.
+  waDeliveryCheckMinutes: int('WA_DELIVERY_CHECK_MINUTES', 2, { min: 0 }),
+  // A new sending number starts slowly: for its first WA_WARMUP_DAYS days of sending, at most WA_WARMUP_DAILY_CAP messages a day
+  // (or the plan's own limit, if lower). Cold messages from a fresh number to people who never heard from it are what WhatsApp holds back.
+  // WA_WARMUP_DAYS=0 switches this off.
+  waWarmupDays: int('WA_WARMUP_DAYS', 14, { min: 0, max: 90 }),
+  waWarmupDailyCap: int('WA_WARMUP_DAILY_CAP', 40, { min: 1 }),
   // How long a number that WhatsApp refused (restricted or banned) is treated as out of use before it may try again.
   // Replies to email campaigns are read from the owner's mailbox (IMAP) this often; IMAP_REPLIES=false turns the reader off on this server.
   imapReplies: bool('IMAP_REPLIES', true),

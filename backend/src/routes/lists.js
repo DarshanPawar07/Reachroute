@@ -4,7 +4,7 @@ import multer from 'multer';
 import { config } from '../config.js';
 import { ContactList, ListContact } from '../models.js';
 import { resolveLimits } from '../plans/limits.js';
-import { parseContacts, parseEmailContacts } from '../utils/contacts.js';
+import { normalizeEmail, normalizePhone, parseContacts, parseEmailContacts } from '../utils/contacts.js';
 import { bad, validId } from '../utils/http.js';
 import { MAX_COLUMNS } from '../utils/contacts.js';
 
@@ -17,8 +17,43 @@ const PARSERS = {
 };
 const valueOf = (kind, c) => (kind === 'whatsapp' ? c.phone : c.email);
 
-async function insertContacts(list, userId, contacts) {
-  const docs = contacts.map((c) => ({ listId: list._id, userId, name: c.name, value: valueOf(list.kind, c), ...(c.fields ? { fields: c.fields } : {}) }));
+export const MAX_GROUPS_PER_CONTACT = 10;
+const MAX_GROUP_LENGTH = 30;
+
+/** Group labels from a request: a list, or one text with commas. Lower case, no repeats. */
+export function cleanGroups(raw) {
+  if (raw === undefined || raw === null || raw === '') return [];
+  const parts = Array.isArray(raw) ? raw : String(raw).split(',');
+  const out = [];
+  for (const part of parts) {
+    const g = String(part ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+    if (!g) continue;
+    if (g.length > MAX_GROUP_LENGTH) throw bad(`A group name can have at most ${MAX_GROUP_LENGTH} characters ("${g.slice(0, 12)}..." is too long).`);
+    if (!out.includes(g)) out.push(g);
+  }
+  if (out.length > MAX_GROUPS_PER_CONTACT) throw bad(`A contact can be in at most ${MAX_GROUPS_PER_CONTACT} groups.`);
+  return out;
+}
+
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Which contacts of a list to show: the ones matching a search text (name, email or phone) and/or a group. */
+function contactFilter(listId, { q, group }) {
+  const filter = { listId };
+  const text = typeof q === 'string' ? q.trim().slice(0, 100) : '';
+  if (text) {
+    const ors = [{ name: new RegExp(escapeRegex(text), 'i') }, { value: new RegExp(escapeRegex(text), 'i') }];
+    const digits = text.replace(/\D/g, '');
+    if (digits.length >= 3 && digits !== text) ors.push({ value: new RegExp(escapeRegex(digits)) }); // "+91 98765" finds 9198765...
+    filter.$or = ors;
+  }
+  const g = typeof group === 'string' ? group.trim().toLowerCase() : '';
+  if (g) filter.groups = g;
+  return filter;
+}
+
+async function insertContacts(list, userId, contacts, groups = []) {
+  const docs = contacts.map((c) => ({ listId: list._id, userId, name: c.name, value: valueOf(list.kind, c), ...(groups.length ? { groups } : {}), ...(c.fields ? { fields: c.fields } : {}) }));
   for (let i = 0; i < docs.length; i += 1000) {
     await ListContact.insertMany(docs.slice(i, i + 1000), { ordered: false });
   }
@@ -84,6 +119,7 @@ export function listsRouter() {
       throw bad(`You can have at most ${limits.maxLists} lists. Delete one first.`, 429);
     }
 
+    const groups = cleanGroups(req.body.group);
     const parsed = await PARSERS[kind](req.file.buffer, req.file.originalname, limits.maxListContacts);
     if (!parsed.contacts.length) return res.status(400).json({ error: 'No valid contacts in that file.', invalid: parsed.invalid.slice(0, 20) });
 
@@ -94,7 +130,7 @@ export function listsRouter() {
       throw duplicateName(err);
     }
     try {
-      await insertContacts(list, req.userId, parsed.contacts);
+      await insertContacts(list, req.userId, parsed.contacts, groups);
     } catch (err) {
       await ListContact.deleteMany({ listId: list._id }).catch(() => {});
       await ContactList.deleteOne({ _id: list._id }).catch(() => {});
@@ -111,11 +147,15 @@ export function listsRouter() {
     const list = await findList(req.userId, req.params.id);
     const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
     const page = Math.max(Number(req.query.page) || 1, 1);
-    const [contacts, counts] = await Promise.all([
-      ListContact.find({ listId: list._id }).sort({ _id: 1 }).skip((page - 1) * limit).limit(limit).select('name value fields lastCampaignAt').lean(),
+    const filter = contactFilter(list._id, req.query);
+    const [contacts, counts, matching, groupRows] = await Promise.all([
+      ListContact.find(filter).sort({ _id: 1 }).skip((page - 1) * limit).limit(limit).select('name value fields lastCampaignAt groups').lean(),
       countsFor(req.userId, [list._id]),
+      ListContact.countDocuments(filter),
+      ListContact.aggregate([{ $match: { listId: list._id } }, { $unwind: '$groups' }, { $group: { _id: '$groups', n: { $sum: 1 } } }, { $sort: { _id: 1 } }]),
     ]);
-    res.json({ list: present(list, counts.get(String(list._id))), contacts, page, limit });
+    // `matching` = how many contacts fit the search/group (equals the list size when nothing is searched)
+    res.json({ list: present(list, counts.get(String(list._id))), contacts, matching, groups: groupRows.map((g) => ({ name: g._id, count: g.n })), page, limit });
   });
 
   router.patch('/:id', async (req, res) => {
@@ -135,6 +175,7 @@ export function listsRouter() {
     if (!req.file) throw bad('Upload a .csv, .xlsx or .json file of contacts');
 
     const { limits } = await resolveLimits(req.userId);
+    const groups = cleanGroups(req.body.group);
     const parsed = await PARSERS[list.kind](req.file.buffer, req.file.originalname, limits.maxListContacts);
     const values = parsed.contacts.map((c) => valueOf(list.kind, c));
     const have = new Set((await ListContact.find({ listId: list._id, value: { $in: values } }).select('value').lean()).map((c) => c.value));
@@ -144,13 +185,66 @@ export function listsRouter() {
     if (existing + fresh.length > limits.maxListContacts) {
       throw bad(`A list can hold ${limits.maxListContacts} contacts. This one has ${existing} and the file would add ${fresh.length} new ones.`, 400);
     }
+    // People already in the list also join the group, so one upload can label everyone in the file.
+    if (groups.length && have.size) await ListContact.updateMany({ listId: list._id, value: { $in: [...have] } }, { $addToSet: { groups: { $each: groups } } });
     if (fresh.length) {
-      await insertContacts(list, req.userId, fresh);
+      await insertContacts(list, req.userId, fresh, groups);
       // new columns join the list's columns (up to the limit)
       const columns = [...new Set([...list.columns, ...parsed.columns])].slice(0, MAX_COLUMNS);
       if (columns.length !== list.columns.length) await ContactList.updateOne({ _id: list._id }, { $set: { columns } });
     }
     res.json({ added: fresh.length, alreadyInList: have.size, invalid: parsed.invalid.slice(0, 20), invalidCount: parsed.invalid.length, columns: parsed.columns, ignoredColumns: parsed.ignoredColumns });
+  });
+
+  // The phone number or email as it is stored, or a 400 when it looks wrong.
+  const cleanValue = (kind, raw) => {
+    const value = kind === 'whatsapp' ? normalizePhone(raw, config.defaultCountry) : normalizeEmail(raw);
+    if (!value) throw bad(kind === 'whatsapp' ? 'That phone number does not look valid. Include the country code, like +91 98765 43210.' : 'That email address does not look valid.');
+    return value;
+  };
+  const cleanContactName = (raw) => {
+    const name = typeof raw === 'string' ? raw.trim() : '';
+    if (name.length > 100) throw bad('The name is too long (max 100 characters)');
+    return name;
+  };
+  const sameValue = (err, kind) => (err?.code === 11000 ? bad(kind === 'whatsapp' ? 'That number is already in this list' : 'That email is already in this list', 409) : err);
+
+  // Add one contact by hand.
+  router.post('/:id/contacts/one', async (req, res) => {
+    const list = await findList(req.userId, req.params.id);
+    const { limits } = await resolveLimits(req.userId);
+    if ((await ListContact.countDocuments({ listId: list._id })) >= limits.maxListContacts) throw bad(`A list can hold ${limits.maxListContacts} contacts.`, 400);
+    const doc = { listId: list._id, userId: req.userId, name: cleanContactName(req.body?.name), value: cleanValue(list.kind, req.body?.value), groups: cleanGroups(req.body?.groups) };
+    try {
+      const c = await ListContact.create(doc);
+      res.status(201).json({ contact: { _id: c._id, name: c.name, value: c.value, groups: c.groups, lastCampaignAt: null } });
+    } catch (err) {
+      throw sameValue(err, list.kind);
+    }
+  });
+
+  // Change a contact's name, number/email or groups. A different number or email is a different person: it counts as "not messaged yet".
+  router.patch('/:id/contacts/:contactId', async (req, res) => {
+    const list = await findList(req.userId, req.params.id);
+    const contact = await ListContact.findOne({ _id: req.params.contactId, listId: list._id });
+    if (!contact) throw bad('Contact not found', 404);
+    const b = req.body || {};
+    if (b.name === undefined && b.value === undefined && b.groups === undefined) throw bad('Send a name, a phone/email or groups to change.');
+    if (b.name !== undefined) contact.name = cleanContactName(b.name);
+    if (b.groups !== undefined) contact.groups = cleanGroups(b.groups);
+    if (b.value !== undefined) {
+      const value = cleanValue(list.kind, b.value);
+      if (value !== contact.value) {
+        contact.value = value;
+        contact.lastCampaignAt = null;
+      }
+    }
+    try {
+      await contact.save();
+    } catch (err) {
+      throw sameValue(err, list.kind);
+    }
+    res.json({ contact: { _id: contact._id, name: contact.name, value: contact.value, groups: contact.groups, lastCampaignAt: contact.lastCampaignAt } });
   });
 
   // Forget which contacts were messaged, so "only people not messaged yet" includes everyone again.

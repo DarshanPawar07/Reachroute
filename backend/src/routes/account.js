@@ -4,19 +4,21 @@ import { checkVersions, consentStatus, recordAcceptance } from '../legal/consent
 import { ContactList, Template } from '../models.js';
 import { usageOf } from '../attachments/store.js';
 import { limitTable } from '../plans/limits.js';
+import { quotaSummary } from '../plans/quota.js';
 
 /** The logged-in person's own plan and limits, and how much of the saved-item limits they use. */
 export function accountRouter() {
   const router = Router();
 
   router.get('/plan', async (req, res) => {
-    const [table, lists, templates, files] = await Promise.all([
+    const [table, lists, templates, files, quota] = await Promise.all([
       limitTable(req.userId),
       ContactList.countDocuments({ userId: req.userId }),
       Template.countDocuments({ userId: req.userId }),
       usageOf(req.userId),
+      quotaSummary(req.userId),
     ]);
-    res.json({ ...table, usage: { lists, templates, attachments: files.count, storageBytes: files.bytes } });
+    res.json({ ...table, usage: { lists, templates, attachments: files.count, storageBytes: files.bytes }, quota });
   });
 
   // Which documents this account has accepted, and which it still has to.

@@ -2,8 +2,20 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import Icon from '../components/Icon.jsx';
+import SentChart from '../components/SentChart.jsx';
 import { fmtDate } from '../lib/kinds.js';
-import { Alert, Badge, Card, LinkButton, PageHeader } from '../components/ui.jsx';
+import AllowanceBanner from '../components/AllowanceBanner.jsx';
+import GettingStarted from '../components/GettingStarted.jsx';
+import { Alert, Badge, Button, Card, LinkButton, PageHeader, Stat } from '../components/ui.jsx';
+
+const RANGES = [7, 30, 90];
+const TIME_ZONE = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+})();
 
 /** One channel: its state, how much of today's limit is used, and the two things you do next. */
 function ChannelTile({ name, icon, tint, bar, status, ready, sent, cap, left, openTo, newTo, hint }) {
@@ -49,6 +61,9 @@ function ChannelTile({ name, icon, tint, bar, status, ready, sent, cap, left, op
 export default function Dashboard() {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
+  const [range, setRange] = useState(30);
+  const [stats, setStats] = useState(null);
+  const [statsError, setStatsError] = useState('');
 
   useEffect(() => {
     api('/api/dashboard')
@@ -56,9 +71,31 @@ export default function Dashboard() {
       .catch((e) => setError(e.message));
   }, []);
 
+  // The charts: how much went out each day, per channel. A failure here must not hide the rest of the dashboard.
+  useEffect(() => {
+    let live = true;
+    setStatsError('');
+    api(`/api/stats?days=${range}&tz=${encodeURIComponent(TIME_ZONE)}`)
+      .then((r) => live && setStats(r))
+      .catch((e) => live && setStatsError(e.message));
+    return () => {
+      live = false;
+    };
+  }, [range]);
+
+  const days = stats ? stats.whatsapp.daily.map((d, i) => ({ date: d.date, whatsapp: d.sent, email: stats.email.daily[i]?.sent || 0 })) : [];
+  const sent = stats ? stats.whatsapp.sent + stats.email.sent : 0;
+  const failed = stats ? stats.whatsapp.failed + stats.email.failed : 0;
+  const rate = sent + failed ? Math.round((sent / (sent + failed)) * 1000) / 10 : null;
+  const optOuts = stats ? stats.optOuts.whatsappStopped + stats.optOuts.emailUnsubscribed + stats.optOuts.emailBounced + stats.optOuts.emailComplaints : 0;
+
   return (
     <>
       <PageHeader title="What would you like to send?" subtitle="Pick a channel to start a campaign. Your limits for today are shown below." />
+      <div className="mb-5 space-y-4">
+        <AllowanceBanner />
+        {data && <GettingStarted data={data} />}
+      </div>
       {error && <Alert>{error}</Alert>}
 
       <div className="grid gap-5 md:grid-cols-2">
@@ -109,6 +146,39 @@ export default function Dashboard() {
           }
         />
       </div>
+
+      <Card className="mt-5">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold">Activity</h2>
+            <p className="text-sm text-stone-600">Messages sent per day, in the last {range} days.</p>
+          </div>
+          <div className="flex gap-1.5" role="group" aria-label="Time range">
+            {RANGES.map((r) => (
+              <Button key={r} variant={r === range ? 'accent' : 'secondary'} className="!px-3 !py-1.5 text-sm" onClick={() => setRange(r)} aria-pressed={r === range}>
+                {r} days
+              </Button>
+            ))}
+          </div>
+        </div>
+        {statsError && <Alert>{statsError}</Alert>}
+        {!stats && !statsError && <p className="py-6 text-sm text-stone-500">Loading...</p>}
+        {stats && (
+          <>
+            <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Stat label="Sent" value={sent} sub={`in ${range} days`} />
+              <Stat label="Success rate" value={rate === null ? '-' : `${rate}%`} sub={rate === null ? 'nothing sent yet' : 'of messages tried'} />
+              <Stat label="Failed" value={failed} />
+              <Stat label="Opted out" value={optOuts} sub="all time" />
+            </div>
+            {sent + failed === 0 ? (
+              <p className="rounded-xl border border-dashed border-stone-300 px-4 py-8 text-center text-sm text-stone-600">Nothing sent in this period yet. Your daily activity will show up here.</p>
+            ) : (
+              <SentChart days={days} />
+            )}
+          </>
+        )}
+      </Card>
 
       <Card className="mt-5">
         <h2 className="mb-1 text-lg font-semibold">Recent campaigns</h2>

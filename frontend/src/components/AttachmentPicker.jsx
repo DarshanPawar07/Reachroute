@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
 import { fmtSize } from '../lib/kinds.js';
 import { Alert, Button } from './ui.jsx';
+import { askConfirm } from './ConfirmDialog.jsx';
 
 const ICON = { image: 'Picture', video: 'Video', audio: 'Sound', document: 'Document' };
 
@@ -62,7 +63,7 @@ export default function AttachmentPicker({ kind, value, onChange }) {
   };
 
   const remove = async (a) => {
-    if (!window.confirm(`Delete "${a.name}" from your files?`)) return;
+    if (!await askConfirm(`Delete "${a.name}" from your files?`)) return;
     setError('');
     try {
       await api(`/api/attachments/${a.id}`, { method: 'DELETE' });

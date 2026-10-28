@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { config } from './config.js';
 import { LIMIT_KEYS } from './plans/definitions.js';
 
 const { Schema } = mongoose;
@@ -82,7 +83,10 @@ const limitsSchema = new Schema(Object.fromEntries(LIMIT_KEYS.map((k) => [k, { t
 const userSchema = new Schema(
   {
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    passwordHash: { type: String, required: true },
+    // Accounts created through Google or GitHub sign-in have no password until the person chooses one ("Forgot password").
+    passwordHash: { type: String },
+    // The sign-in providers linked to this account: [{ provider: 'google' | 'github', id: '<their id for the person>' }]
+    oauth: { type: [new Schema({ provider: { type: String, enum: ['google', 'github'], required: true }, id: { type: String, required: true } }, { _id: false })], default: undefined },
     failedLogins: { type: Number, default: 0 },
     lockedUntil: { type: Date, default: null },
     // No default on purpose: accounts created before this field existed have none, and count as verified.
@@ -104,10 +108,20 @@ const userSchema = new Schema(
     // The plan this account is on (null = the default plan: the server settings), and limits set for this account alone.
     planKey: { type: String, default: null },
     limitOverrides: { type: limitsSchema, default: undefined },
+    // Messages this account has sent, for good: the "in total" limits of a plan count from here, so deleting old
+    // campaigns never gives messages back.
+    // Billing details printed on invoices (all optional).
+    billing: { type: new Schema({ name: String, address: String, state: String, gstin: String }, { _id: false }), default: undefined },
+    sentTotals: { type: new Schema({ whatsapp: { type: Number, default: 0 }, email: { type: Number, default: 0 } }, { _id: false }), default: undefined },
   },
   { timestamps: true }
 );
+// A new account starts on the default plan (DEFAULT_PLAN_KEY). Accounts made before plans existed keep planKey null.
+userSchema.pre('validate', function startOnDefaultPlan() {
+  if (this.isNew && (this.planKey === null || this.planKey === undefined) && config.defaultPlanKey) this.planKey = config.defaultPlanKey;
+});
 userSchema.index({ createdAt: -1 }); // the admin user list
+userSchema.index({ 'oauth.provider': 1, 'oauth.id': 1 }, { sparse: true });
 userSchema.index({ webhookKeyHash: 1 }, { unique: true, partialFilterExpression: { webhookKeyHash: { $type: 'string' } } });
 
 // One-time links for password reset and email verification. Only a hash of the token is stored.
@@ -133,10 +147,19 @@ campaignSchema.index({ userId: 1, status: 1 });
 campaignSchema.index({ status: 1, updatedAt: 1 });
 
 const recipientSchema = new Schema(
-  { ...recipientFields('Campaign'), phone: { type: String, required: true } }, // digits only, E.164 without '+'
+  {
+    ...recipientFields('Campaign'),
+    phone: { type: String, required: true }, // digits only, E.164 without '+'
+    // What happened after WhatsApp accepted the message ("sent" only means our server handed it over):
+    waMessageId: { type: String, default: null }, // WhatsApp's id for the message, to match its delivery receipts
+    deliveredAt: { type: Date, default: null }, // the contact's phone confirmed it received the message
+    readAt: { type: Date, default: null }, // the contact opened it (only when they have read receipts on)
+  },
   { timestamps: true }
 );
 recipientIndexes(recipientSchema, 'phone');
+recipientSchema.index({ userId: 1, waMessageId: 1 }, { partialFilterExpression: { waMessageId: { $type: 'string' } } }); // delivery receipts look rows up by this
+recipientSchema.index({ userId: 1, sentAt: -1 }, { partialFilterExpression: { waMessageId: { $type: 'string' } } }); // the delivery health check
 
 // A message a contact sent back after a campaign message. Only people the account messaged in a campaign are stored.
 const replySchema = new Schema(
@@ -287,12 +310,14 @@ const listContactSchema = new Schema(
     fields: { type: Schema.Types.Mixed, default: undefined }, // the contact's other columns
     value: { type: String, required: true }, // phone digits (WhatsApp) or lower-case email (email)
     lastCampaignAt: { type: Date, default: null }, // null = never included in a campaign
+    groups: { type: [String], default: [] }, // labels the owner put on this contact (lower case): "pune", "customers"
   },
   { timestamps: true }
 );
 listContactSchema.index({ listId: 1, value: 1 }, { unique: true });
 listContactSchema.index({ listId: 1, lastCampaignAt: 1, _id: 1 }); // "next batch of people not messaged yet"
 listContactSchema.index({ userId: 1, listId: 1 }); // counts per list
+listContactSchema.index({ listId: 1, groups: 1, _id: 1 }); // one group of a list
 
 // ---------------------------------------------------------------- saved message templates
 const templateSchema = new Schema(
@@ -339,9 +364,48 @@ const planSchema = new Schema(
     key: { type: String, required: true, unique: true, lowercase: true, trim: true },
     name: { type: String, required: true, trim: true },
     limits: { type: limitsSchema, default: () => ({}) },
+    // What the plan costs, in rupees, for a month and for a year. 0 = not sold online (free, or handled by hand).
+    priceMonthly: { type: Number, default: 0, min: 0 },
+    priceYearly: { type: Number, default: 0, min: 0 },
+    tagline: { type: String, default: '', trim: true },
+    sortOrder: { type: Number, default: 100 },
+    // Shown on the pricing and billing pages. A hidden plan can still be given to accounts by an administrator.
+    listed: { type: Boolean, default: true },
+    // The plan as created at Razorpay for each billing period. Made again when the price changes.
+    razorpay: {
+      type: new Schema({ month: { id: String, amount: Number }, year: { id: String, amount: Number } }, { _id: false }),
+      default: undefined,
+    },
   },
   { timestamps: true }
 );
+
+// One paid subscription at Razorpay. The newest active one decides what an account is paying for.
+const subscriptionSchema = new Schema(
+  {
+    userId: ref('User'),
+    planKey: { type: String, required: true },
+    interval: { type: String, enum: ['month', 'year'], required: true },
+    amount: { type: Number, required: true }, // paise charged each period, as asked for at the time
+    razorpaySubscriptionId: { type: String, required: true, unique: true },
+    razorpayPlanId: { type: String, required: true },
+    status: { type: String, default: 'created' }, // Razorpay's: created authenticated active pending halted cancelled completed expired
+    paidCount: { type: Number, default: 0 },
+    currentStart: { type: Date, default: null },
+    currentEnd: { type: Date, default: null }, // the plan is paid for until here
+    cancelAtCycleEnd: { type: Boolean, default: false },
+    lastPaymentId: { type: String, default: '' },
+    endedAt: { type: Date, default: null }, // set once the account has been moved off the plan
+    reminderFor: { type: Date, default: null }, // the period end we already sent a "your plan is ending" email for
+  },
+  { timestamps: true }
+);
+subscriptionSchema.index({ userId: 1, createdAt: -1 });
+subscriptionSchema.index({ endedAt: 1, currentEnd: 1 });
+
+// Razorpay webhook events already handled (it may send the same one twice).
+const billingEventSchema = new Schema({ _id: { type: String }, type: { type: String }, at: { type: Date, default: Date.now } });
+billingEventSchema.index({ at: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
 
 // Who did what, and when: administrator actions and security-relevant account events. Entries are only ever added
 // (nothing in the API changes or removes them); old ones are deleted after AUDIT_RETENTION_DAYS.
@@ -367,6 +431,8 @@ auditLogSchema.index({ actorEmail: 1, at: -1 });
 auditLogSchema.index({ targetEmail: 1, at: -1 });
 
 export const User = mongoose.model('User', userSchema);
+export const Subscription = mongoose.model('Subscription', subscriptionSchema);
+export const BillingEvent = mongoose.model('BillingEvent', billingEventSchema);
 export const Campaign = mongoose.model('Campaign', campaignSchema);
 export const Recipient = mongoose.model('Recipient', recipientSchema);
 export const OptOut = mongoose.model('OptOut', optOutSchema);
@@ -383,6 +449,7 @@ const imapSettingsSchema = new Schema(
     user: { type: String, required: true, trim: true },
     passEncrypted: { type: String, default: '' }, // AES-256-GCM, never returned to the client
     enabled: { type: Boolean, default: true },
+    bouncesOnly: { type: Boolean, default: false }, // true = only look for bounce notices; replies from people are not kept
     // Where reading stopped: the mailbox's UID validity and the last message number handled, so each message is read once.
     uidValidity: { type: Number, default: null },
     lastUid: { type: Number, default: null },
@@ -442,8 +509,36 @@ const consentSchema = new Schema({
 });
 consentSchema.index({ userId: 1, doc: 1, version: 1 }, { unique: true });
 
+// Messages sent through the public Contact page. Kept so an administrator can read and answer them (Admin > Messages).
+export const CONTACT_TOPICS = ['plans', 'support', 'instagram', 'facebook', 'other'];
+const contactMessageSchema = new Schema(
+  {
+    name: { type: String, required: true, trim: true, maxlength: 100 },
+    email: { type: String, required: true, lowercase: true, trim: true, maxlength: 254 },
+    topic: { type: String, enum: CONTACT_TOPICS, default: 'other' },
+    plan: { type: String, default: '', maxlength: 20 }, // which plan they asked about, when the topic is plans
+    message: { type: String, required: true, maxlength: 4000 },
+    ip: { type: String, default: '' },
+    handled: { type: Boolean, default: false },
+  },
+  { timestamps: true }
+);
+contactMessageSchema.index({ handled: 1, createdAt: -1 });
+export const ContactMessage = mongoose.model('ContactMessage', contactMessageSchema);
+
 export const AuditLog = mongoose.model('AuditLog', auditLogSchema);
 export const Consent = mongoose.model('Consent', consentSchema);
+
+// The 6-digit code emailed when someone signs up, one per account. Only a keyed hash of the code is stored.
+const signupOtpSchema = new Schema({
+  userId: { type: Schema.Types.ObjectId, required: true, unique: true },
+  codeHash: { type: String, required: true },
+  attempts: { type: Number, default: 0 },
+  sentAt: { type: Date, required: true },
+  expiresAt: { type: Date, required: true },
+});
+signupOtpSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 3600 }); // removed an hour after it stops working
+export const SignupOtp = mongoose.model('SignupOtp', signupOtpSchema);
 
 // The one-time code sent to a sender address, one per account. Only a keyed hash of the code is stored.
 const senderOtpSchema = new Schema({
@@ -482,4 +577,51 @@ export const Attachment = mongoose.model('Attachment', attachmentSchema);
 export const SenderOtp = mongoose.model('SenderOtp', senderOtpSchema);
 export const RateBucket = mongoose.model('RateBucket', rateBucketSchema);
 export const WaRestriction = mongoose.model('WaRestriction', waRestrictionSchema);
+
+// A copy of each WhatsApp message we sent, kept for a few days. When the other phone cannot open a message it asks us to send it
+// again; the copy lets us answer even after a restart. Without it the chat is left on "Waiting for this message".
+const waSentCopySchema = new Schema({
+  userId: { type: String, required: true },
+  messageId: { type: String, required: true },
+  data: { type: Buffer, required: true }, // the message, encoded by WhatsApp's own format
+  createdAt: { type: Date, default: Date.now, expires: 3 * 24 * 60 * 60 }, // Mongo removes it after 3 days
+});
+waSentCopySchema.index({ userId: 1, messageId: 1 }, { unique: true });
+export const WaSentCopy = mongoose.model('WaSentCopy', waSentCopySchema);
 export const Plan = mongoose.model('Plan', planSchema);
+
+// One invoice per payment. Seller and buyer details are copied in, so an old invoice never changes when settings or profiles do.
+const invoiceSchema = new Schema(
+  {
+    userId: ref('User'),
+    key: { type: String, required: true, unique: true }, // "<razorpay subscription id>:<payment number>": one invoice per payment, even if told twice
+    number: { type: String, required: true, unique: true },
+    issuedAt: { type: Date, default: Date.now },
+    planKey: String,
+    planName: String,
+    interval: String,
+    periodStart: Date,
+    periodEnd: Date,
+    paymentId: { type: String, default: '' },
+    gstRate: { type: Number, default: 0 },
+    totalPaise: { type: Number, required: true },
+    taxablePaise: { type: Number, required: true },
+    cgstPaise: { type: Number, default: 0 },
+    sgstPaise: { type: Number, default: 0 },
+    igstPaise: { type: Number, default: 0 },
+    seller: { type: Schema.Types.Mixed },
+    buyer: { type: Schema.Types.Mixed },
+    // Refund notes (credit notes) an administrator issued against this payment. The money itself is returned in the Razorpay dashboard.
+    creditNotes: {
+      type: [new Schema({ number: String, amountPaise: Number, reason: String, issuedAt: { type: Date, default: Date.now }, byEmail: String }, { _id: true })],
+      default: [],
+    },
+  },
+  { timestamps: true }
+);
+invoiceSchema.index({ userId: 1, issuedAt: -1 });
+export const Invoice = mongoose.model('Invoice', invoiceSchema);
+
+// Running numbers (invoice numbers restart every financial year).
+const counterSchema = new Schema({ _id: { type: String }, seq: { type: Number, default: 0 } });
+export const Counter = mongoose.model('Counter', counterSchema);

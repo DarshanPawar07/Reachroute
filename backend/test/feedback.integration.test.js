@@ -10,7 +10,7 @@ import http from 'node:http';
 const URI = process.env.TEST_MONGO_URI;
 if (URI && !/test/i.test(URI)) throw new Error('TEST_MONGO_URI must contain "test"');
 const skip = URI ? false : 'set TEST_MONGO_URI to a throw-away database to run these tests';
-delete process.env.SMTP_HOST;
+process.env.SMTP_HOST = ''; // empty, not deleted: a real .env would otherwise fill it back in
 process.env.ALERT_EMAILS = 'false';
 
 const mongoose = (await import('mongoose')).default;

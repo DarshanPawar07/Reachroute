@@ -10,6 +10,7 @@ import { renderEmail } from '../utils/emailTemplate.js';
 import { renderMessage } from '../utils/template.js';
 import { loadAttachment } from '../attachments/store.js';
 import { engineLimits } from '../plans/limits.js';
+import { assertQuota, countSent, quotaRoom } from '../plans/quota.js';
 import { signUnsubscribe } from '../utils/unsubscribeToken.js';
 import { purgeExpiredReplies } from '../whatsapp/replies.js';
 import { assertCanSend, handleRestriction, isBanSignal, noteBanSignal, restrictedReason, restrictionEvents } from '../whatsapp/restriction.js';
@@ -28,6 +29,30 @@ const text = (v, label, max) => {
 
 // ============================================================ WhatsApp
 
+// A number that has only just started bulk sending is held to a small daily amount for its first days (see WA_WARMUP_DAYS).
+const warmupCache = new Map(); // userId -> { at, firstSentAt }
+async function firstSendAt(userId) {
+  const id = String(userId);
+  const hit = warmupCache.get(id);
+  if (hit && Date.now() - hit.at < 60_000) return hit.firstSentAt;
+  const first = await Recipient.findOne({ userId, status: 'sent' }).sort({ sentAt: 1 }).select('sentAt').lean();
+  const firstSentAt = first?.sentAt ? first.sentAt.getTime() : null;
+  warmupCache.set(id, { at: Date.now(), firstSentAt });
+  while (warmupCache.size > 5000) warmupCache.delete(warmupCache.keys().next().value);
+  return firstSentAt;
+}
+export const forgetWarmup = () => warmupCache.clear();
+
+/** The account's limits, lowered while its number is still new. `warmup` says so, for the messages shown to the person. */
+export async function whatsappLimits(userId) {
+  const own = await engineLimits('whatsapp', userId);
+  if (!config.waWarmupDays) return own;
+  const first = await firstSendAt(userId);
+  const day = first === null ? 0 : Math.floor((Date.now() - first) / 86_400_000);
+  if (day >= config.waWarmupDays || own.dailyCap <= config.waWarmupDailyCap) return own;
+  return { ...own, dailyCap: config.waWarmupDailyCap, warmup: { day: day + 1, days: config.waWarmupDays } };
+}
+
 export const whatsappChannel = {
   name: 'whatsapp',
   Campaign,
@@ -36,8 +61,12 @@ export const whatsappChannel = {
   contactField: 'phone',
   limits: { dailyCap: config.dailyCap, hourlyCap: config.waHourlyCap, minDelay: config.minDelaySeconds, maxDelay: config.maxDelaySeconds },
   // The caps of one account come from its plan (the numbers above are the server-wide defaults).
-  limitsFor: (userId) => engineLimits('whatsapp', userId),
+  limitsFor: (userId) => whatsappLimits(userId),
   uploadLimit: 'waMaxUpload',
+  // The plan's totals (Free: so many in all; Pro and Premium: so many a month).
+  checkQuota: (userId, adding) => assertQuota(userId, 'whatsapp', adding),
+  quotaRoom: async (userId) => (await quotaRoom(userId, 'whatsapp')).room,
+  countSent: (userId) => countSent(userId, 'whatsapp'),
   // Only the instance that holds a user's WhatsApp session can send for that user.
   ownedUserIds: () => wa.ownedUserIds(),
   // Runs with the retention clean-up: replies are kept as long as finished campaigns are.
@@ -45,6 +74,8 @@ export const whatsappChannel = {
 
   // The texts that can contain {{variables}}.
   templateTexts: (fields) => [fields.template],
+  // The content of a finished campaign, to send again as a new one.
+  contentOf: (c) => ({ name: c.name, template: c.template, appendOptOut: c.appendOptOut }),
 
   readFields(body) {
     return {
@@ -80,8 +111,8 @@ export const whatsappChannel = {
     try {
       const ref = campaign.attachments?.[0];
       const media = ref ? await loadAttachment(userId, ref.attachmentId) : null;
-      await wa.sendMessage(userId, phone, renderMessage(campaign.template, recipient.name, { appendOptOut: campaign.appendOptOut, fields: recipient.fields }), media);
-      return { outcome: 'sent' };
+      const sent = await wa.sendMessage(userId, phone, renderMessage(campaign.template, recipient.name, { appendOptOut: campaign.appendOptOut, fields: recipient.fields }), media);
+      return { outcome: 'sent', waMessageId: sent?.id || null };
     } catch (err) {
       if (isMissingFile(err)) return { outcome: 'failed', pause: MISSING_FILE };
       if (err.code === 'NOT_ON_WHATSAPP') return { outcome: 'skipped', reason: 'not on WhatsApp' };
@@ -109,9 +140,13 @@ export const emailChannel = {
   limits: { dailyCap: config.emailDailyCap, minDelay: config.emailMinDelaySeconds, maxDelay: config.emailMaxDelaySeconds },
   limitsFor: (userId) => engineLimits('email', userId),
   uploadLimit: 'emailMaxUpload',
+  checkQuota: (userId, adding) => assertQuota(userId, 'email', adding),
+  quotaRoom: async (userId) => (await quotaRoom(userId, 'email')).room,
+  countSent: (userId) => countSent(userId, 'email'),
   // Any instance can send email.
 
   templateTexts: (fields) => [fields.subject, ...(fields.subjectB ? [fields.subjectB] : []), fields.body],
+  contentOf: (c) => ({ name: c.name, subject: c.subject, subjectB: c.subjectB, splitB: c.splitB, body: c.body, bodyFormat: c.bodyFormat }),
 
   readFields(body) {
     const subject = text(body.subject, 'Subject', 200);

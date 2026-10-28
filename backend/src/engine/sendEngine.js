@@ -47,6 +47,9 @@ export function createEngine(channel) {
   const { name, Campaign, Recipient, contactField, limits, deliver, ownedUserIds, purgeExpired } = channel;
   const log = logger.child({ engine: name });
   // Daily and hourly limits and the number of unfinished campaigns, for one account.
+  const checkQuota = channel.checkQuota || (async () => {}); // the plan's "in total" limits (plans/quota.js)
+  const countSent = channel.countSent || (async () => {});
+  const quotaRoom = channel.quotaRoom || (async () => Infinity);
   const limitsFor = channel.limitsFor || (async () => ({ dailyCap: limits.dailyCap, hourlyCap: limits.hourlyCap, maxActive: config.maxActiveCampaigns }));
   const gap = () => rand(limits.minDelay, limits.maxDelay) * 1000;
   const lockKey = (userId) => `schedule:${name}:${userId}`;
@@ -129,7 +132,7 @@ export function createEngine(channel) {
   /** How many more messages this user may queue for the day around `atMs` (default: today). */
   async function remainingToday(userId, atMs = Date.now()) {
     const { dailyCap } = await limitsFor(userId);
-    return Math.max(0, dailyCap - (await usedInDay(userId, atMs)));
+    return Math.max(0, Math.min(dailyCap - (await usedInDay(userId, atMs)), await quotaRoom(userId)));
   }
 
   // ------------------------------------------------------------------ scheduling
@@ -173,6 +176,10 @@ export function createEngine(channel) {
     });
   }
 
+  // A new WhatsApp number is held to a small daily amount for a while (channels.js); say so when that is why a limit was hit.
+  const warmupNote = (own) =>
+    own.warmup ? ` This number is new (day ${own.warmup.day} of ${own.warmup.days}), so it is kept to ${own.dailyCap} a day at first to protect it from WhatsApp restrictions.` : '';
+
   // ------------------------------------------------------------------ campaign lifecycle (called by routes)
 
   async function createCampaign({ userId, fields, contacts, startAt = null, sendWindow = null }) {
@@ -186,10 +193,12 @@ export function createEngine(channel) {
       const used = await usedInDay(userId, start ? start.getTime() : Date.now());
       if (used + contacts.length > own.dailyCap) {
         throw bad(
-          `Daily limit is ${own.dailyCap} per account. ${used} already used around ${start ? 'that start time' : 'now'}, this campaign needs ${contacts.length}.`,
+          `Daily limit is ${own.dailyCap} per account. ${used} already used around ${start ? 'that start time' : 'now'}, this campaign needs ${contacts.length}.${warmupNote(own)}`,
           429
         );
       }
+
+      await checkQuota(userId, contacts.length);
 
       // Recipients are inserted while the campaign is still 'preparing', so nothing can be sent half-built.
       const campaign = await Campaign.create({ userId, ...fields, startAt: start, sendWindow, total: contacts.length, status: 'preparing' });
@@ -257,8 +266,9 @@ export function createEngine(channel) {
         const when = startAt && startAt.getTime() > Date.now() ? startAt : null;
         const waiting = await Recipient.countDocuments({ campaignId: c._id, status: 'pending' });
         const used = await usedInDay(userId, when ? when.getTime() : Date.now(), { exceptCampaign: c._id });
-        const { dailyCap } = await limitsFor(userId);
-        if (used + waiting > dailyCap) throw bad(`Daily limit is ${dailyCap} per account. ${used} already used around that start time, this campaign needs ${waiting}.`, 429);
+        const own = await limitsFor(userId);
+        const dailyCap = own.dailyCap;
+        if (used + waiting > dailyCap) throw bad(`Daily limit is ${dailyCap} per account. ${used} already used around that start time, this campaign needs ${waiting}.${warmupNote(own)}`, 429);
         set.startAt = when;
       }
       if (!Object.keys(set).length) return c;
@@ -281,8 +291,11 @@ export function createEngine(channel) {
       if (!failed.length) throw bad('There are no failed messages to retry', 400);
 
       const used = await usedInDay(userId);
-      const { dailyCap } = await limitsFor(userId);
-      if (used + failed.length > dailyCap) throw bad(`Retrying ${failed.length} would pass your daily limit of ${dailyCap}.`, 429);
+      const own = await limitsFor(userId);
+      const dailyCap = own.dailyCap;
+      if (used + failed.length > dailyCap) throw bad(`Retrying ${failed.length} would pass your daily limit of ${dailyCap}.${warmupNote(own)}`, 429);
+
+      await checkQuota(userId, failed.length);
 
       const ids = failed.map((f) => f._id);
       await Recipient.updateMany({ _id: { $in: ids } }, { $set: { status: 'pending', error: null, ambiguous: false, scheduledFor: null, deferCount: 0 } });
@@ -319,8 +332,11 @@ export function createEngine(channel) {
     const done = { claimedAt: null, claimedBy: null, scheduledFor: null };
     switch (res.outcome) {
       case 'sent': {
-        const u = await Recipient.updateOne({ _id: r._id, status: 'sending' }, { $set: { status: 'sent', sentAt: new Date(), error: null, ambiguous: false, ...done } });
-        if (u.modifiedCount) await Campaign.updateOne({ _id: campaign._id }, { $inc: { sentCount: 1 }, $set: { consecutiveFailures: 0 } });
+        const u = await Recipient.updateOne({ _id: r._id, status: 'sending' }, { $set: { status: 'sent', sentAt: new Date(), error: null, ambiguous: false, ...(res.waMessageId ? { waMessageId: res.waMessageId } : {}), ...done } });
+        if (u.modifiedCount) {
+          await Campaign.updateOne({ _id: campaign._id }, { $inc: { sentCount: 1 }, $set: { consecutiveFailures: 0 } });
+          await countSent(r.userId);
+        }
         return;
       }
       case 'skipped': {
@@ -562,5 +578,5 @@ export function createEngine(channel) {
     if (inFlight > 0) log.warn({ inFlight }, 'stopped with sends still in progress; the reaper will mark them');
   }
 
-  return { name, createCampaign, updateSchedule, pause, resume, cancel, retryFailed, pauseAllForUser, remainingToday, counts, recount, start, stop, tick, reap, purgeOld };
+  return { name, createCampaign, updateSchedule, pause, resume, cancel, retryFailed, pauseAllForUser, remainingToday, checkQuota, counts, recount, start, stop, tick, reap, purgeOld };
 }

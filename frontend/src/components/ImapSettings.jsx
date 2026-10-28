@@ -2,10 +2,11 @@ import { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { fmtDate } from '../lib/kinds.js';
 import { Alert, Button, Card, Field, Input, Select } from './ui.jsx';
+import { askConfirm } from './ConfirmDialog.jsx';
 
 const EMPTY = { host: '', port: 993, secure: true, user: '', pass: '' };
 
-/** Where replies are read from: the mailbox the owner already uses, over IMAP. */
+/** Bounce detection: the mailbox where "could not be delivered" notices arrive, read over IMAP. Replies from people are not kept. */
 export default function ImapSettings() {
   const [info, setInfo] = useState(null);
   const [form, setForm] = useState(EMPTY);
@@ -47,8 +48,8 @@ export default function ImapSettings() {
   const save = async (e) => {
     e.preventDefault();
     const res = await run(
-      () => api('/api/email/imap', { method: 'PUT', body: { ...form, port: Number(form.port) } }),
-      'Connected. New replies are now read automatically. Mail that arrived before now is not read.'
+      () => api('/api/email/imap', { method: 'PUT', body: { ...form, port: Number(form.port), bouncesOnly: true } }),
+      'Connected. Bounce notices are now read automatically. Mail that arrived before now is not read.'
     );
     if (res) {
       setInfo({ ...info, settings: res.settings });
@@ -57,15 +58,15 @@ export default function ImapSettings() {
     }
   };
 
-  const check = () => run(() => api('/api/email/imap/check', { method: 'POST' }), (r) => (r.busy ? 'A check is already running.' : r.stored ? `${r.stored} new ${r.stored === 1 ? 'reply' : 'replies'} found.` : 'No new replies.')).then(() => api('/api/email/imap').then(apply).catch(() => {}));
+  const check = () => run(() => api('/api/email/imap/check', { method: 'POST' }), (r) => (r.busy ? 'A check is already running.' : r.bounces ? `${r.bounces} bounced ${r.bounces === 1 ? 'address' : 'addresses'} found. They will not be emailed again.` : 'No new bounces.')).then(() => api('/api/email/imap').then(apply).catch(() => {}));
 
   const toggle = async (enabled) => {
-    const res = await run(() => api('/api/email/imap/enabled', { method: 'POST', body: { enabled } }), enabled ? 'Reading replies again.' : 'Paused. No mail is read until you turn it back on.');
+    const res = await run(() => api('/api/email/imap/enabled', { method: 'POST', body: { enabled } }), enabled ? 'Looking for bounces again.' : 'Paused. No mail is read until you turn it back on.');
     if (res) setInfo({ ...info, settings: res.settings });
   };
 
   const remove = async () => {
-    if (!window.confirm('Remove the mailbox details? The saved password is deleted. Replies already received stay.')) return;
+    if (!await askConfirm('Remove the mailbox details? The saved password is deleted. Addresses that already bounced stay on the do-not-email list.')) return;
     const res = await run(() => api('/api/email/imap', { method: 'DELETE' }), 'Removed.');
     if (res) {
       setInfo({ ...info, settings: null });
@@ -85,16 +86,17 @@ export default function ImapSettings() {
 
   return (
     <Card>
-      <h2 className="text-lg font-semibold">Replies</h2>
+      <h2 className="text-lg font-semibold">Detect bounced emails</h2>
       <p className="mb-4 mt-1 text-sm text-stone-600">
-        Connect the mailbox where replies arrive. We only read the Inbox, only for people you emailed in a campaign, and only mail that arrives after you connect. Someone who replies "unsubscribe" or "stop" is not emailed again.
+        When an address does not exist, the mail server sends a "could not be delivered" notice to your mailbox. Connect that mailbox and we read those notices, stop emailing the dead addresses, and mark them in your campaign reports. Keeping bounces low protects your sender reputation.
+        We only read the Inbox, only look for bounce notices about people you emailed in a campaign, and only mail that arrives after you connect. Replies from people are not kept. A full mailbox or a spam block does not count as a bounce.
       </p>
-      {!info.available && <Alert kind="warn">Reading replies is switched off on this server.</Alert>}
+      {!info.available && <Alert kind="warn">Reading the mailbox is switched off on this server.</Alert>}
 
       {s && (
         <div className="mb-4 space-y-2 text-sm">
           <p>
-            {s.enabled ? 'Reading' : 'Paused:'} <strong>{s.user}</strong> at {s.host}.{' '}
+            {s.enabled ? 'Watching' : 'Paused:'} <strong>{s.user}</strong> at {s.host}.{' '}
             {s.lastCheckedAt ? `Last checked ${fmtDate(s.lastCheckedAt)}.` : 'Not checked yet.'} Checked about every {Math.round(info.pollSeconds / 60)} minutes.
           </p>
           {s.lastError && <Alert kind="warn">{s.lastError}</Alert>}
@@ -113,7 +115,7 @@ export default function ImapSettings() {
       )}
 
       <form onSubmit={save} className="space-y-4">
-        <Field label="Provider preset" hint="Fills in the server. Brevo and Amazon SES have no mailbox: use the mailbox where your Reply-to address lands.">
+        <Field label="Provider preset" hint="Fills in the server. Use the mailbox of the account you send from (Gmail, Outlook...). Sending services like Brevo or Amazon SES have no mailbox: they report bounces through the webhook instead.">
           <Select defaultValue="" onChange={applyPreset}>
             <option value="">Choose a provider...</option>
             {info.providers.map((p) => (

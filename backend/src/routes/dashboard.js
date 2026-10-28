@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { config } from '../config.js';
 import { emailEngine, whatsappEngine } from '../engine/channels.js';
-import { Campaign, EmailCampaign, EmailRecipient, Recipient, SmtpSettings } from '../models.js';
+import { Campaign, ContactList, EmailCampaign, EmailRecipient, Recipient, SmtpSettings } from '../models.js';
 import { resolveLimits } from '../plans/limits.js';
 import { getStatus } from '../whatsapp/sessionManager.js';
 
@@ -24,7 +24,7 @@ router.get('/', async (req, res) => {
   const userId = req.userId;
   const { plan, limits: own } = await resolveLimits(userId);
 
-  const [wa, waSent, emailSent, waRemaining, emailRemaining, smtp, waRecent, emailRecent] = await Promise.all([
+  const [wa, waSent, emailSent, waRemaining, emailRemaining, smtp, waRecent, emailRecent, hasList] = await Promise.all([
     getStatus(userId),
     sentSince(Recipient, userId, since),
     sentSince(EmailRecipient, userId, since),
@@ -33,6 +33,7 @@ router.get('/', async (req, res) => {
     SmtpSettings.exists({ userId }),
     recentOf(Campaign, userId, 'whatsapp'),
     recentOf(EmailCampaign, userId, 'email'),
+    ContactList.exists({ userId }),
   ]);
 
   const recent = [...waRecent, ...emailRecent]
@@ -57,6 +58,7 @@ router.get('/', async (req, res) => {
       remainingToday: emailRemaining,
     },
     recent,
+    hasList: Boolean(hasList), // for the getting-started checklist
   });
 });
 

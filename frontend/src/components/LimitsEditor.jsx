@@ -17,7 +17,7 @@ export default function LimitsEditor({ defs, value, placeholders = {}, onChange,
             min={1}
             step={1}
             disabled={disabled}
-            placeholder={placeholders[d.key] !== undefined ? String(placeholders[d.key]) : 'standard'}
+            placeholder={placeholders[d.key] === 0 ? 'no limit' : placeholders[d.key] !== undefined ? String(placeholders[d.key]) : 'standard'}
             value={value[d.key] ?? ''}
             onChange={(e) => onChange({ ...value, [d.key]: e.target.value })}
           />

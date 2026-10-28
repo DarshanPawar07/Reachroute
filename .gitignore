@@ -25,3 +25,6 @@ coverage/
 mongo-data/
 backups/
 *.bak
+*.env
+.env.*
+!.env.example

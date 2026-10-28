@@ -27,6 +27,11 @@ export function buildTransport({ host, port, secure, user, pass, tlsServername }
   });
 }
 
+/** For tests: make `transport` (anything with sendMail) the sender of this account. */
+export function primeSenderForTests(userId, transport, { address = 'sender@example.com', name = '' } = {}) {
+  cache.set(String(userId), { transport: { ...transport, close() {}, verify: async () => true }, from: { name, address }, replyTo: undefined, at: Date.now(), own: true, verified: true });
+}
+
 export function invalidateSender(userId) {
   const entry = cache.get(String(userId));
   if (entry) {

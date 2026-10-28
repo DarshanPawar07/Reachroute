@@ -1,12 +1,13 @@
 import { EventEmitter } from 'node:events';
-import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, proto } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import { config } from '../config.js';
-import { OptOut, SessionLease } from '../models.js';
+import { OptOut, SessionLease, WaSentCopy } from '../models.js';
 import { bad } from '../utils/http.js';
 import { logger } from '../utils/logger.js';
 import { rand } from '../utils/template.js';
 import { clearAuthState, useMongoAuthState, usersWithSavedLogin } from './authState.js';
+import { recordDelivery } from './delivery.js';
 import { extractIncoming } from './incoming.js';
 import { buildContents } from './media.js';
 import { recordReply } from './replies.js';
@@ -26,6 +27,46 @@ export const sessionEvents = new EventEmitter();
  * holds a given WhatsApp login (two at once makes WhatsApp kick both off).
  */
 const sessions = new Map();
+
+// Copies of the messages we sent recently. WhatsApp sometimes asks the sender to send a message again (the other phone could not
+// decrypt it the first time); without a copy to hand back, the other side is left with "Waiting for this message. This may take a while".
+// The copy is kept in memory (fast) and in the database (so it survives a restart or a move to another server).
+const SENT_KEEP_MS = 24 * 60 * 60_000;
+const SENT_KEEP_MAX = 3000;
+const sentCopies = new Map(); // `${userId}:${messageId}` -> { message, at }
+function rememberSent(userId, sent) {
+  const id = sent?.key?.id;
+  if (!id || !sent.message) return;
+  sentCopies.set(`${userId}:${id}`, { message: sent.message, at: Date.now() });
+  for (const [k, v] of sentCopies) {
+    if (sentCopies.size <= SENT_KEEP_MAX && Date.now() - v.at < SENT_KEEP_MS) break; // oldest come first
+    sentCopies.delete(k);
+  }
+  try {
+    const data = Buffer.from(proto.Message.encode(proto.Message.fromObject(sent.message)).finish());
+    WaSentCopy.updateOne({ userId: String(userId), messageId: id }, { $setOnInsert: { data, createdAt: new Date() } }, { upsert: true }).catch((err) =>
+      log.warn({ err: err.message }, 'could not save a copy of a sent message')
+    );
+  } catch (err) {
+    log.warn({ err: err.message }, 'could not encode a sent message for safekeeping');
+  }
+}
+
+/** The message WhatsApp wants again: from memory, or from the database after a restart. */
+async function findSent(userId, key) {
+  const hit = sentCopies.get(`${userId}:${key.id}`);
+  if (hit) return hit.message;
+  try {
+    const row = await WaSentCopy.findOne({ userId: String(userId), messageId: key.id }).select('data').lean();
+    if (!row) return undefined;
+    const message = proto.Message.decode(row.data.buffer ? Buffer.from(row.data.buffer) : row.data);
+    sentCopies.set(`${userId}:${key.id}`, { message, at: Date.now() });
+    return message;
+  } catch (err) {
+    log.warn({ err: err.message }, 'could not read back a sent message');
+    return undefined;
+  }
+}
 const timers = [];
 let shuttingDown = false;
 
@@ -167,7 +208,12 @@ async function onConnectionUpdate(userId, entry, sock, update) {
   // reconnecting, because the new connection reads it back from there.
   await entry.flush?.();
 
-  if (code === DisconnectReason.badSession || code === DisconnectReason.multideviceMismatch) {
+  // WhatsApp's server can end the connection with its own generic 500 ("Stream Errored", for example right after it did not like a
+  // message). That is the same number as "bad session" but says nothing about the saved login, which is fine: just reconnect.
+  const streamError = /^stream errored/i.test(why || '');
+  if (streamError) log.warn({ userId, code, why }, 'WhatsApp ended the connection; reconnecting and keeping the saved login');
+
+  if (!streamError && (code === DisconnectReason.badSession || code === DisconnectReason.multideviceMismatch)) {
     // The saved login is damaged. Start over with a fresh QR code instead of looping on it.
     log.warn({ userId, code }, 'saved WhatsApp login is unusable; clearing it so a new QR can be scanned');
     await clearAuthState(userId);
@@ -189,16 +235,24 @@ async function connect(userId, entry) {
     const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
     const sock = makeWASocket({
       version,
-      auth: state,
+      // The cached key store keeps the encryption keys of this connection in memory and writes every change through, so a message being
+      // read while another is being sent never sees half-saved keys. Baileys recommends it for any real use.
+      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, baileysLog) },
       logger: baileysLog,
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      // Hands WhatsApp the original message when it asks for a re-send (see sentCopies above).
+      getMessage: (key) => findSent(userId, key),
     });
     entry.sock = sock;
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('messages.upsert', ({ messages, type }) => {
       if (type === 'notify') handleIncoming(userId, messages).catch(() => {});
+    });
+    // The contact's phone confirming it received (and later read) a message we sent.
+    sock.ev.on('messages.update', (updates) => {
+      recordDelivery(userId, updates).catch(() => {});
     });
     sock.ev.on('connection.update', (update) => {
       onConnectionUpdate(userId, entry, sock, update).catch((err) => log.error({ err, userId }, 'connection update failed'));
@@ -279,6 +333,7 @@ export async function connectedPhone(userId) {
 /**
  * Send one message: the text, or a file (picture, video, sound, document) with its text.
  * Checks the number is on WhatsApp and mimics typing. `media` is { buffer, mime, name, kind } or null.
+ * Returns { id }: WhatsApp's id of the (last) message sent.
  */
 export async function sendMessage(userId, phone, text, media = null) {
   const entry = sessions.get(String(userId));
@@ -292,8 +347,14 @@ export async function sendMessage(userId, phone, text, media = null) {
   await sock.presenceSubscribe(jid);
   await sock.sendPresenceUpdate('composing', jid);
   await sleep(rand(1500, 4000));
-  for (const content of buildContents(text, media)) await sock.sendMessage(jid, content);
-  await sock.sendPresenceUpdate('paused', jid);
+  let last = null;
+  for (const content of buildContents(text, media)) {
+    last = await sock.sendMessage(jid, content);
+    rememberSent(userId, last);
+  }
+  await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+  // The id lets us match WhatsApp's delivery receipts to the person in the campaign.
+  return { id: last?.key?.id || null };
 }
 
 /** Send one text message. */

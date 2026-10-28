@@ -70,6 +70,12 @@ export function createLimiters() {
     settingsWrite: limiter('settings', { windowMs: HOUR, limit: 30, perUser: true }),
     attachmentUpload: limiter('attachup', { windowMs: HOUR, limit: 60, perUser: true, message: 'Too many uploads. Try again later.' }),
     imapCheck: limiter('imapcheck', { windowMs: 10 * MIN, limit: 10, perUser: true, message: 'Too many checks. Replies are also read automatically every few minutes.' }),
+    testSend: limiter('testsend', { windowMs: 10 * MIN, limit: 10, perUser: true, message: 'Too many test emails. Wait a few minutes.' }),
+    // the public Contact form: a few messages an hour from one network
+    contact: limiter('contact', { windowMs: HOUR, limit: 5, message: 'You have sent several messages already. Please wait a while before writing again.' }),
+    // the sign-up code: guesses are also capped per code, this only stops floods
+    signupOtp: limiter('signupotp', { windowMs: 10 * MIN, limit: 20, perUser: true, message: 'Too many attempts. Wait a few minutes and try again.' }),
+    oauth: limiter('oauth', { windowMs: 10 * MIN, limit: 60, message: 'Too many sign-in attempts. Wait a few minutes and try again.' }),
     senderOtp: limiter('senderotp', { windowMs: HOUR, limit: 10, perUser: true, message: 'Too many verification codes requested. Try again in an hour.' }),
   };
 }

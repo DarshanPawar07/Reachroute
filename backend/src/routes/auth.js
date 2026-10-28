@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { fromReq, record } from '../audit/audit.js';
@@ -7,6 +6,7 @@ import { forgetUser, requireAuth, signToken } from '../middleware/auth.js';
 import { recordAcceptance } from '../legal/consent.js';
 import { User } from '../models.js';
 import { consumeToken, isVerified, issueToken, recentlyIssued } from '../utils/authTokens.js';
+import { CODE_MINUTES, issueSignupOtp, verifySignupOtp } from '../utils/signupOtp.js';
 import { normalizeEmail } from '../utils/contacts.js';
 import { bad } from '../utils/http.js';
 import { logger } from '../utils/logger.js';
@@ -19,15 +19,14 @@ const MAX_FAILED_LOGINS = 8; // after this many wrong passwords in a row the acc
 const LOCK_MS = 15 * 60_000;
 const EMAIL_COOLDOWN_MS = 60_000; // one reset / verification email per minute per account
 
-// Compared against when the email is unknown, so a login for a missing account takes as long as a real one
-// and response time does not reveal which emails are registered.
-const dummyHash = bcrypt.hash(randomUUID(), BCRYPT_COST);
-
 function checkPassword(password) {
   if (typeof password !== 'string' || password.length < 8) throw bad('Password must be at least 8 characters');
   // bcrypt only reads the first 72 bytes. Refuse longer ones instead of silently ignoring the rest.
   if (Buffer.byteLength(password, 'utf8') > 72) throw bad('Password is too long (the limit is 72 bytes)');
 }
+
+/** An error the web app can recognise by its `code` and show in the right place. */
+const coded = (message, status, code) => Object.assign(bad(message, status), { code });
 
 const present = (user) => ({ id: user._id, email: user.email, emailVerified: isVerified(user) });
 const session = (user) => ({ token: signToken(user), user: present(user) });
@@ -35,39 +34,53 @@ const session = (user) => ({ token: signToken(user), user: present(user) });
 /** Run something after the response was sent. A failure is logged, never shown to the person. */
 const inBackground = (promise, what) => promise.catch((err) => log.warn({ err: err.message }, `could not ${what}`));
 
-/** Email a one-time link: type 'verify' (confirm the address) or 'reset' (choose a new password). */
+/**
+ * Email a one-time link: type 'verify' (confirm the address) or 'reset' (choose a new password).
+ * The 'verify' email also carries a 6-digit code: people type it on the sign-up page, or click the link instead.
+ */
 async function emailLink(user, type) {
   const token = await issueToken(user._id, type);
   const isReset = type === 'reset';
   const url = `${config.appUrl}/${isReset ? 'reset-password' : 'verify-email'}?token=${token}`;
+  if (isReset) {
+    return sendSystemEmail({
+      to: user.email,
+      subject: 'Reset your Reachroute password',
+      text: `Someone asked to reset the password for this account. To choose a new password, open:\n\n${url}\n\nThe link works once and expires in 1 hour.\nIf this was not you, ignore this email: your password stays the same.`,
+    });
+  }
+  const code = await issueSignupOtp(user._id);
   return sendSystemEmail({
     to: user.email,
-    subject: isReset ? 'Reset your Bulk Messenger password' : 'Confirm your email address',
-    text: isReset
-      ? `Someone asked to reset the password for this account. To choose a new password, open:\n\n${url}\n\nThe link works once and expires in 1 hour.\nIf this was not you, ignore this email: your password stays the same.`
-      : `Welcome to Bulk Messenger. Please confirm your email address:\n\n${url}\n\nThe link works once and expires in 24 hours.\nIf you did not create this account, ignore this email.`,
+    subject: 'Confirm your email address',
+    text:
+      `Your Reachroute verification code is ${code}\n\nType it on the sign-up page. It works for ${CODE_MINUTES} minutes.\n\n` +
+      `You can also confirm with one click instead (the link works once and expires in 24 hours):\n${url}\n\n` +
+      'If you did not create this account, ignore this email.',
   });
 }
 
+const providerNames = (user) => (user.oauth || []).map((o) => (o.provider === 'github' ? 'GitHub' : 'Google'));
+
 /** `limiters` = { login, register, passwordReset, accountToken, resendVerification, changePassword } (all optional). */
-export function authRouter({ login: loginLimiter, register: registerLimiter, passwordReset, accountToken, resendVerification, changePassword: changePasswordLimiter } = {}) {
+export function authRouter({ login: loginLimiter, register: registerLimiter, passwordReset, accountToken, resendVerification, changePassword: changePasswordLimiter, signupOtp } = {}) {
   const router = Router();
   const use = (limiter) => (limiter ? [limiter] : []);
 
   router.post('/register', ...use(registerLimiter), async (req, res) => {
     const email = normalizeEmail(req.body?.email);
-    if (!email) throw bad('Enter a valid email address');
+    if (!email) throw coded('That does not look like an email address. Check it for typos (for example name@gmail.com).', 400, 'invalid_email');
     checkPassword(req.body?.password);
     const accepted = req.body?.acceptTerms === true;
     if (config.requireTermsAcceptance && !accepted) throw bad('Please accept the Terms of Service and Privacy Policy to create an account');
-    if (await User.exists({ email })) throw bad('That email is already registered', 409);
+    if (await User.exists({ email })) throw coded('An account with this email already exists. Log in instead, or use "Forgot password" if you do not remember it.', 409, 'email_taken');
 
     const passwordHash = await bcrypt.hash(req.body.password, BCRYPT_COST);
     let user;
     try {
       user = await User.create({ email, passwordHash, emailVerified: false });
     } catch (err) {
-      if (err.code === 11000) throw bad('That email is already registered', 409); // two sign-ups at once
+      if (err.code === 11000) throw coded('An account with this email already exists. Log in instead.', 409, 'email_taken'); // two sign-ups at once
       throw err;
     }
     if (accepted) {
@@ -78,34 +91,44 @@ export function authRouter({ login: loginLimiter, register: registerLimiter, pas
     res.status(201).json(session(user));
   });
 
+  // Each way a login can fail gets its own message and `code`, so the person is told what to fix.
+  // (This does let someone check whether an email has an account. The per-IP failed-login limit and the
+  // account lock after repeated wrong passwords keep that from being used at scale.)
   router.post('/login', ...use(loginLimiter), async (req, res) => {
-    const email = normalizeEmail(req.body?.email);
+    const rawEmail = req.body?.email;
     const password = req.body?.password;
-    const invalid = () => bad('Invalid email or password', 401);
-    if (!email || typeof password !== 'string' || password.length > 1024) throw invalid();
+    if (typeof rawEmail !== 'string' || !rawEmail.trim()) throw coded('Enter your email address.', 400, 'email_required');
+    const email = normalizeEmail(rawEmail);
+    if (!email) throw coded('That does not look like an email address. Check it for typos (for example name@gmail.com).', 400, 'invalid_email');
+    if (typeof password !== 'string' || !password) throw coded('Enter your password.', 400, 'password_required');
+    if (password.length > 1024) throw coded('Wrong password. Try again, or choose "Forgot password" to reset it.', 401, 'wrong_password');
 
     const user = await User.findOne({ email });
-    if (user?.lockedUntil && user.lockedUntil > new Date()) {
+    if (!user) throw coded('No account found with this email. Check the spelling, or create an account.', 404, 'no_account');
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
       const mins = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 60_000);
-      throw bad(`Too many failed attempts. Try again in ${mins} minute${mins === 1 ? '' : 's'}.`, 429);
+      throw coded(`Too many wrong passwords. This account is locked for ${mins} more minute${mins === 1 ? '' : 's'}. You can reset your password to unlock it now.`, 429, 'locked');
+    }
+    if (!user.passwordHash) {
+      const via = providerNames(user).join(' or ') || 'a social account';
+      throw coded(`This account was created with ${via} and has no password. Use the ${via} button, or choose "Forgot password" to create a password.`, 400, 'use_oauth');
     }
 
-    const matches = await bcrypt.compare(password, user ? user.passwordHash : await dummyHash);
-    if (!user || !matches) {
-      if (user) {
-        const updated = await User.findOneAndUpdate({ _id: user._id }, { $inc: { failedLogins: 1 } }, { returnDocument: 'after' });
-        if (updated && updated.failedLogins >= MAX_FAILED_LOGINS) {
-          await User.updateOne({ _id: user._id }, { $set: { lockedUntil: new Date(Date.now() + LOCK_MS), failedLogins: 0 } });
-          await record({ ip: req.ip, requestId: req.id, actorId: user._id, actorEmail: user.email, action: 'login.locked', detail: `after ${MAX_FAILED_LOGINS} wrong passwords` });
-        }
+    if (!(await bcrypt.compare(password, user.passwordHash))) {
+      const updated = await User.findOneAndUpdate({ _id: user._id }, { $inc: { failedLogins: 1 } }, { returnDocument: 'after' });
+      if (updated && updated.failedLogins >= MAX_FAILED_LOGINS) {
+        await User.updateOne({ _id: user._id }, { $set: { lockedUntil: new Date(Date.now() + LOCK_MS), failedLogins: 0 } });
+        await record({ ip: req.ip, requestId: req.id, actorId: user._id, actorEmail: user.email, action: 'login.locked', detail: `after ${MAX_FAILED_LOGINS} wrong passwords` });
+        throw coded(`Too many wrong passwords. This account is locked for ${Math.round(LOCK_MS / 60_000)} minutes. You can reset your password to unlock it now.`, 429, 'locked');
       }
-      throw invalid();
+      const left = MAX_FAILED_LOGINS - (updated?.failedLogins || 0);
+      const warn = left <= 3 ? ` ${left} more wrong ${left === 1 ? 'try' : 'tries'} will lock the account for a while.` : '';
+      throw coded(`Wrong password. Try again, or choose "Forgot password" to reset it.${warn}`, 401, 'wrong_password');
     }
 
-    // Said only after the password was right, so nobody can find out who is suspended by guessing emails.
     if (user.suspendedAt) {
       await record({ ip: req.ip, requestId: req.id, actorId: user._id, actorEmail: user.email, action: 'login.blocked', detail: 'account is suspended' });
-      throw bad('This account has been suspended. Please contact support.', 403);
+      throw coded('This account has been suspended. Please contact support.', 403, 'suspended');
     }
 
     await User.updateOne({ _id: user._id }, { $set: { failedLogins: 0, lockedUntil: null, lastLoginAt: new Date() } });
@@ -137,6 +160,7 @@ export function authRouter({ login: loginLimiter, register: registerLimiter, pas
     checkPassword(newPassword);
     const user = await User.findById(req.userId);
     if (!user) throw bad('Please log in', 401);
+    if (!user.passwordHash) throw bad('This account signs in with Google or GitHub and has no password yet. Log out, then use "Forgot password" on the login page to create one.');
     // 400, not 401: the app treats 401 as "your login expired" and would sign the person out.
     if (typeof currentPassword !== 'string' || currentPassword.length > 1024 || !(await bcrypt.compare(currentPassword, user.passwordHash))) {
       throw bad('Your current password is not right');
@@ -150,7 +174,7 @@ export function authRouter({ login: loginLimiter, register: registerLimiter, pas
     inBackground(
       sendSystemEmail({
         to: user.email,
-        subject: 'Your Bulk Messenger password was changed',
+        subject: 'Your Reachroute password was changed',
         text: 'The password for this account was just changed, and every other device was signed out.\nIf this was not you, reset your password again right away.',
       }),
       'send the password-changed notice'
@@ -160,21 +184,19 @@ export function authRouter({ login: loginLimiter, register: registerLimiter, pas
 
   // ---------------------------------------------------------------- forgot / reset password
 
-  // Always answers the same way, so nobody can use this form to find out which emails have an account.
-  // The answer is sent first and the email afterwards, so the response time does not give it away either.
+  // Tells the person when there is no account for the address (instead of pretending a link was sent).
   router.post('/forgot-password', ...use(passwordReset), async (req, res) => {
-    const email = normalizeEmail(req.body?.email);
-    if (!email) throw bad('Enter a valid email address');
-    res.json({ ok: true, message: 'If an account exists for that email, a reset link is on its way. It works for 1 hour.' });
+    const rawEmail = req.body?.email;
+    if (typeof rawEmail !== 'string' || !rawEmail.trim()) throw coded('Enter your email address.', 400, 'email_required');
+    const email = normalizeEmail(rawEmail);
+    if (!email) throw coded('That does not look like an email address. Check it for typos (for example name@gmail.com).', 400, 'invalid_email');
 
-    inBackground(
-      (async () => {
-        const user = await User.findOne({ email }).select('email').lean();
-        if (!user || (await recentlyIssued(user._id, 'reset', EMAIL_COOLDOWN_MS))) return;
-        await emailLink(user, 'reset');
-      })(),
-      'send the reset email'
-    );
+    const user = await User.findOne({ email }).select('email').lean();
+    if (!user) throw coded('No account found with this email. Check the spelling, or create an account.', 404, 'no_account');
+    if (await recentlyIssued(user._id, 'reset', EMAIL_COOLDOWN_MS)) throw coded('We just sent a reset link. Check your inbox and spam folder, or wait a minute before asking again.', 429, 'cooldown');
+
+    res.json({ ok: true, message: 'A reset link is on its way. It works for 1 hour.' });
+    inBackground(emailLink(user, 'reset'), 'send the reset email');
   });
 
   router.post('/reset-password', ...use(accountToken), async (req, res) => {
@@ -196,7 +218,7 @@ export function authRouter({ login: loginLimiter, register: registerLimiter, pas
     inBackground(
       sendSystemEmail({
         to: user.email,
-        subject: 'Your Bulk Messenger password was changed',
+        subject: 'Your Reachroute password was changed',
         text: 'The password for this account was just changed.\nIf this was you, there is nothing to do. If it was not, reset your password again right away.',
       }),
       'send the password-changed notice'
@@ -214,11 +236,20 @@ export function authRouter({ login: loginLimiter, register: registerLimiter, pas
     res.json({ ok: true });
   });
 
+  // The 6-digit code from the sign-up email. The person is logged in (they just signed up or logged in), so no email is asked for.
+  router.post('/verify-otp', requireAuth, ...use(signupOtp), async (req, res) => {
+    const user = await User.findById(req.userId).select('email emailVerified').lean();
+    if (!user) throw bad('Please log in', 401);
+    if (isVerified(user)) return res.json({ ok: true, alreadyVerified: true, user: present(user) });
+    await verifySignupOtp(user._id, req.body?.code);
+    res.json({ ok: true, user: present({ ...user, emailVerified: true }) });
+  });
+
   router.post('/resend-verification', requireAuth, ...use(resendVerification), async (req, res) => {
     const user = await User.findById(req.userId).select('email emailVerified').lean();
     if (!user) throw bad('Please log in', 401);
     if (isVerified(user)) return res.json({ ok: true, alreadyVerified: true });
-    if (await recentlyIssued(user._id, 'verify', EMAIL_COOLDOWN_MS)) throw bad('We just sent one. Please wait a minute before asking for another.', 429);
+    if (await recentlyIssued(user._id, 'verify', EMAIL_COOLDOWN_MS)) throw coded('We just sent a code. Check your inbox and spam folder, or wait a minute before asking for another.', 429, 'cooldown');
 
     let result;
     try {

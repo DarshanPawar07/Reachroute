@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { fmtDate } from '../lib/kinds.js';
 import { Alert, Button, Card } from './ui.jsx';
+import { askConfirm } from './ConfirmDialog.jsx';
 
 const hoursLeft = (ms) => {
   const minutes = Math.ceil(ms / 60_000);
@@ -54,8 +55,8 @@ export default function RestrictionPanel({ connStatus, onConnection }) {
     }
   };
 
-  const switchNumber = () => {
-    if (!window.confirm('Log out the current WhatsApp number and link a different one? Your campaigns stay saved and can carry on from where they stopped.')) return;
+  const switchNumber = async () => {
+    if (!await askConfirm('Log out the current WhatsApp number and link a different one? Your campaigns stay saved and can carry on from where they stopped.')) return;
     run('/api/whatsapp/switch-number', onConnection);
   };
   const resume = () =>

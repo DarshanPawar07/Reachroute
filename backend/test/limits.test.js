@@ -20,7 +20,8 @@ test('onlyLimits ignores unknown or unusable stored values', () => {
 test('platformLimits has every key as a number, and describeLimits reads well', () => {
   const p = platformLimits();
   assert.deepEqual(Object.keys(p), LIMIT_KEYS);
-  for (const k of LIMIT_KEYS) assert.ok(Number.isInteger(p[k]) && p[k] > 0, k);
+  const NO_LIMIT_BY_DEFAULT = ['waLifetimeCap', 'emailLifetimeCap', 'monthlyCap']; // 0 = no limit
+  for (const k of LIMIT_KEYS) assert.ok(Number.isInteger(p[k]) && (NO_LIMIT_BY_DEFAULT.includes(k) ? p[k] === 0 : p[k] > 0), k);
   assert.equal(describeLimits({ waDailyCap: 5, maxLists: 2 }), 'waDailyCap=5, maxLists=2');
   assert.match(describeLimits({}), /platform defaults/);
 });

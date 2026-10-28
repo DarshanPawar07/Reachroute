@@ -7,6 +7,8 @@ import { closeAllSenders } from './email/mailer.js';
 import { emailEngine, whatsappEngine } from './engine/channels.js';
 import { engineEvents } from './engine/sendEngine.js';
 import { startAuditPurge } from './audit/audit.js';
+import { startBillingJob } from './billing/service.js';
+import { ensureDefaultPlans } from './plans/defaults.js';
 import { startReplyPoller } from './email/imap.js';
 import { createWatchdog } from './monitoring/ops.js';
 import { closeRateLimitStore, createLimiters, initRateLimitStore } from './middleware/limits.js';
@@ -22,6 +24,7 @@ let watchdog;
 let auditPurge;
 let attachmentPurge;
 let replyPoller;
+let stopBilling;
 
 async function connectDatabase() {
   mongoose.set('strictQuery', true);
@@ -40,6 +43,8 @@ async function connectDatabase() {
 async function main() {
   await connectDatabase();
   await initRateLimitStore();
+  const made = await ensureDefaultPlans();
+  if (made.length) logger.info({ plans: made }, 'created the starting plans');
   const app = buildApp(createLimiters(), { isDraining: () => draining });
 
   // When someone's WhatsApp login ends, pause their running campaigns so nothing sits half-sent, and tell them.
@@ -96,6 +101,7 @@ async function main() {
   auditPurge = startAuditPurge();
   attachmentPurge = startAttachmentPurge();
   replyPoller = startReplyPoller();
+  stopBilling = startBillingJob();
 
   server = http.createServer(app);
   server.keepAliveTimeout = 65_000; // longer than common load balancer idle timeouts (60s), so no 502s from reused sockets
@@ -135,6 +141,7 @@ async function shutdown(reason, exitCode = 0) {
     auditPurge?.stop();
     attachmentPurge?.stop();
     replyPoller?.stop();
+    stopBilling?.();
     await Promise.all([whatsappEngine.stop(20_000), emailEngine.stop(20_000)]);
     await wa.shutdown();
     closeAllSenders();

@@ -5,6 +5,8 @@ const tabs = [
   { to: '/admin', label: 'Overview', end: true },
   { to: '/admin/users', label: 'Accounts' },
   { to: '/admin/plans', label: 'Plans' },
+  { to: '/admin/billing', label: 'Billing' },
+  { to: '/admin/messages', label: 'Messages' },
   { to: '/admin/audit', label: 'Activity log' },
 ];
 

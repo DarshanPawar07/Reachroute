@@ -12,7 +12,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const URI = process.env.TEST_MONGO_URI;
 if (URI && !/test/i.test(URI)) throw new Error('TEST_MONGO_URI must contain "test"');
 const skip = URI ? false : 'set TEST_MONGO_URI to a throw-away database to run these tests';
-delete process.env.SMTP_HOST;
+process.env.SMTP_HOST = ''; // empty, not deleted: a real .env would otherwise fill it back in
 
 const mongoose = (await import('mongoose')).default;
 const { config } = await import('../src/config.js');
@@ -180,26 +180,35 @@ test('when verification is required, unverified accounts cannot start campaigns;
 
 // ---------------------------------------------------------------- password reset
 
-test('forgot password: same answer for everyone, one email per minute, and nothing for unknown addresses', T, async () => {
+test('forgot password: unknown addresses are told so, one email per minute for real ones', T, async () => {
   const u = await newUser();
   const ghost = `nobody-${Date.now()}@example.com`;
 
   const a = await call('POST', '/api/auth/forgot-password', { json: { email: ghost } });
+  assert.equal(a.status, 404, say(a));
+  assert.equal(a.body.code, 'no_account');
+  assert.match(a.body.error, /no account/i);
+
   const b = await call('POST', '/api/auth/forgot-password', { json: { email: u.email } });
-  assert.equal(a.status, 200, say(a));
-  assert.deepEqual(a.body, b.body, 'the answer must not reveal whether the account exists');
+  assert.equal(b.status, 200, say(b));
 
   const [mail] = await waitForMails(u.email, RESET);
   assert.ok(mail.text.includes(`${config.appUrl}/reset-password?token=`));
   await sleep(200);
   assert.equal(mailsTo(ghost).length, 0, 'unknown address gets no email');
 
-  await call('POST', '/api/auth/forgot-password', { json: { email: u.email } });
+  const again = await call('POST', '/api/auth/forgot-password', { json: { email: u.email } });
+  assert.equal(again.status, 429, 'a second request within a minute is told to wait');
+  assert.equal(again.body.code, 'cooldown');
   await sleep(300);
-  assert.equal(mailsTo(u.email, RESET).length, 1, 'a second request within a minute sends nothing new');
+  assert.equal(mailsTo(u.email, RESET).length, 1, 'and sends nothing new');
 
-  assert.equal((await call('POST', '/api/auth/forgot-password', { json: { email: 'not-an-email' } })).status, 400);
-  assert.equal((await call('POST', '/api/auth/forgot-password', { json: {} })).status, 400);
+  const bad = await call('POST', '/api/auth/forgot-password', { json: { email: 'not-an-email' } });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.code, 'invalid_email');
+  const none = await call('POST', '/api/auth/forgot-password', { json: {} });
+  assert.equal(none.status, 400);
+  assert.equal(none.body.code, 'email_required');
 });
 
 test('reset password: new password works, old one stops, link is single-use, lock and verification are cleared', T, async () => {

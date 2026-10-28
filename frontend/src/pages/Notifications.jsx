@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { fmtDate } from '../lib/kinds.js';
 import { Alert, Button, Card, PageHeader } from '../components/ui.jsx';
+import { askConfirm } from '../components/ConfirmDialog.jsx';
 
 // Text label as well as colour, so the level never depends on colour alone.
 const LEVELS = {
@@ -49,7 +50,7 @@ export default function Notifications() {
   };
 
   const clear = async () => {
-    if (!window.confirm('Delete all alerts?')) return;
+    if (!await askConfirm('Delete all alerts?')) return;
     try {
       await api('/api/notifications', { method: 'DELETE' });
       await load();

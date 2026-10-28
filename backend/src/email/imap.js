@@ -5,6 +5,7 @@ import { assertPublicHost } from '../utils/hostCheck.js';
 import { logger } from '../utils/logger.js';
 import { notify } from '../utils/notify.js';
 import { describeImapError, flattenHeaders } from './mailText.js';
+import { ingestBounce } from './bounces.js';
 import { ingestMessage } from './replies.js';
 
 export { describeImapError, flattenHeaders };
@@ -119,6 +120,11 @@ async function parseMessage(source, fallbackId) {
   }
   const m = await simpleParser(source, { skipImageLinks: true });
   const from = m.from?.value?.[0] || {};
+  // The machine-readable part of a bounce notice ("message/delivery-status"), as text.
+  const dsn = (m.attachments || [])
+    .filter((a) => /^message\/(global-)?delivery-status$/i.test(a.contentType || '') && Buffer.isBuffer(a.content))
+    .map((a) => a.content.toString('utf8', 0, 20_000))
+    .join('\n\n');
   return {
     messageId: m.messageId || fallbackId,
     from: { address: from.address || '', name: from.name || '' },
@@ -126,6 +132,7 @@ async function parseMessage(source, fallbackId) {
     text: m.text || '',
     date: m.date || new Date(),
     headers: flattenHeaders(m.headers),
+    dsn,
   };
 }
 
@@ -144,7 +151,7 @@ export function setMessageParser(fn) {
  */
 export async function pollUser(settings, { parse = messageParser } = {}) {
   const interval = config.imapPollSeconds * 1000;
-  const result = { stored: 0, optOuts: 0 };
+  const result = { stored: 0, optOuts: 0, bounces: 0 };
   try {
     const client = await connectionFor(settings);
     const read = await client.read({ uidValidity: settings.uidValidity, afterUid: settings.lastUid, limit: BATCH });
@@ -153,10 +160,16 @@ export async function pollUser(settings, { parse = messageParser } = {}) {
     for (const m of read.messages) {
       try {
         const msg = await parse(m.source, `${read.uidValidity}:${m.uid}`);
-        const out = await ingestMessage(settings.userId, msg);
-        if (out.stored) {
-          result.stored += 1;
-          if (out.reply.optOut) result.optOuts += 1;
+        // A "could not be delivered" notice is handled first: it is not a reply from a person.
+        const bounce = await ingestBounce(settings.userId, msg);
+        if (bounce.isBounce) {
+          result.bounces += bounce.stopped;
+        } else if (!settings.bouncesOnly) {
+          const out = await ingestMessage(settings.userId, msg);
+          if (out.stored) {
+            result.stored += 1;
+            if (out.reply.optOut) result.optOuts += 1;
+          }
         }
       } catch (err) {
         if (err?.code === 'IMAP_MODULES_MISSING') throw err;
@@ -171,6 +184,16 @@ export async function pollUser(settings, { parse = messageParser } = {}) {
       { $set: { uidValidity: read.uidValidity, lastUid, lastCheckedAt: new Date(), lastError: '', errorCount: 0, leaseUntil: null, nextCheckAt: new Date(Date.now() + (more ? 5_000 : interval)) } }
     );
 
+    if (result.bounces) {
+      await notify(settings.userId, {
+        type: 'email-bounces',
+        level: 'warning',
+        title: result.bounces === 1 ? '1 email address bounced' : `${result.bounces} email addresses bounced`,
+        message: 'These addresses do not exist, so they will not be emailed again. Removing them from your lists keeps your sender reputation healthy.',
+        link: '/email',
+        dedupeKey: `email-bounces:${settings.userId}`,
+      });
+    }
     if (result.stored) {
       await notify(settings.userId, {
         type: 'email-replies',

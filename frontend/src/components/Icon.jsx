@@ -22,6 +22,17 @@ const paths = {
   menu: <path d="M4 7h16M4 12h16M4 17h16" />,
   logout: <path d="M10 5H6.5A1.5 1.5 0 0 0 5 6.5v11A1.5 1.5 0 0 0 6.5 19H10M14 8l4 4-4 4M18 12H9" />,
   chat: <path d="M5 6.5A2.5 2.5 0 0 1 7.5 4h9A2.5 2.5 0 0 1 19 6.5v6a2.5 2.5 0 0 1-2.5 2.5H11l-4 3.5V15a2.5 2.5 0 0 1-2-2.5v-6z" />,
+  instagram: (
+    <>
+      <rect x="4" y="4" width="16" height="16" rx="4.5" />
+      <circle cx="12" cy="12" r="3.6" />
+      <path d="M16.9 7.1h.01" />
+    </>
+  ),
+  messenger: <path d="M12 3.5c-4.7 0-8.5 3.4-8.5 7.8 0 2.4 1.1 4.5 2.9 5.9V20l2.9-1.6c.9.3 1.7.4 2.7.4 4.7 0 8.5-3.4 8.5-7.8S16.7 3.5 12 3.5zM8.4 13.1l3-3.2 2 1.9 3-1.9-3 3.2-2-1.9-3 1.9z" />,
+  check: <path d="m5 12.5 4.5 4.5L19 7.5" />,
+  close: <path d="M6 6l12 12M18 6 6 18" />,
+  send: <path d="M20 4 10.5 13.5M20 4l-6 16-3.5-6.5L4 10l16-6z" />,
 };
 
 export default function Icon({ name, className = 'h-5 w-5' }) {

@@ -32,6 +32,6 @@ export async function sendSystemEmail({ to, subject, text }) {
     else log.info(`\n---- email (not sent: SMTP_HOST is not set) ----\nTo: ${to}\nSubject: ${subject}\n\n${text}\n------------------------------------------------\n`);
     return { sent: false };
   }
-  await getTransport().sendMail({ from: { name: 'Bulk Messenger', address: smtp.fromEmail }, to, subject, text });
+  await getTransport().sendMail({ from: { name: 'Reachroute', address: smtp.fromEmail }, to, subject, text });
   return { sent: true };
 }

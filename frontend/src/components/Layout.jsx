@@ -8,12 +8,14 @@ import Icon from './Icon.jsx';
 import { Alert, Button } from './ui.jsx';
 
 const groups = [
-  { items: [{ to: '/', label: 'Dashboard', icon: 'home', end: true }] },
+  { items: [{ to: '/dashboard', label: 'Dashboard', icon: 'home', end: true }] },
   {
     title: 'Send',
     items: [
       { to: '/whatsapp', label: 'WhatsApp', icon: 'whatsapp', dot: 'bg-wa' },
       { to: '/email', label: 'Email', icon: 'mail', dot: 'bg-[#7d93f5]' },
+      { to: '/instagram', label: 'Instagram', icon: 'instagram', soon: true },
+      { to: '/facebook', label: 'Facebook', icon: 'messenger', soon: true },
     ],
   },
   {
@@ -24,7 +26,7 @@ const groups = [
       { to: '/notifications', label: 'Alerts', icon: 'bell', badge: true },
     ],
   },
-  { title: 'Your account', items: [{ to: '/account', label: 'Account', icon: 'user' }] },
+  { title: 'Your account', items: [{ to: '/billing', label: 'Plan and billing', icon: 'chart' }, { to: '/account', label: 'Account', icon: 'user' }] },
 ];
 
 /** Shown to accounts that have not confirmed their email address yet. */
@@ -161,11 +163,11 @@ export default function Layout() {
     <div className="min-h-screen md:flex">
       <aside className="bg-stone-900 text-stone-300 md:sticky md:top-0 md:flex md:h-screen md:w-64 md:shrink-0 md:flex-col">
         <div className="px-5 py-5">
-          <NavLink to="/" aria-label="Bulk Messenger home">
+          <NavLink to="/dashboard" aria-label="Reachroute dashboard">
             <Logo light />
           </NavLink>
         </div>
-        <nav className="flex gap-1 overflow-x-auto px-3 pb-3 md:flex-1 md:flex-col md:gap-0 md:overflow-y-auto md:pb-4" aria-label="Main">
+        <nav className="nav-scroll flex gap-1 overflow-x-auto px-3 pb-3 md:flex-1 md:flex-col md:gap-0 md:overflow-y-auto md:pb-4" aria-label="Main">
           {shown.map((group, gi) => (
             <div key={gi} className="flex gap-1 md:mb-5 md:flex-col">
               {group.title && <div className="hidden px-3 pb-1.5 text-[0.8rem] font-medium text-stone-500 md:block">{group.title}</div>}
@@ -181,6 +183,7 @@ export default function Layout() {
                   <Icon name={item.icon} className="h-[1.15rem] w-[1.15rem] shrink-0" />
                   <span className="flex-1">{item.label}</span>
                   {item.dot && <span className={`hidden h-2 w-2 rounded-full md:block ${item.dot}`} />}
+                  {item.soon && <span className="hidden rounded-full border border-white/15 px-2 py-0.5 text-[0.7rem] font-medium text-stone-400 md:block">Soon</span>}
                   {item.badge && unread > 0 && (
                     <span className="rounded-full bg-red-500 px-2 py-0.5 text-xs font-semibold text-white" aria-label={`${unread} unread alerts`}>
                       {unread > 99 ? '99+' : unread}

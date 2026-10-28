@@ -17,6 +17,7 @@ const view = (s) =>
     user: s.user,
     hasPassword: Boolean(s.passEncrypted), // the password is never sent back
     enabled: s.enabled,
+    bouncesOnly: Boolean(s.bouncesOnly),
     lastCheckedAt: s.lastCheckedAt,
     lastError: s.lastError,
   };
@@ -46,6 +47,7 @@ export function imapRouter({ settingsWrite, imapCheck } = {}) {
     const existing = await ImapSettings.findOne({ userId: req.userId }).select('passEncrypted').lean();
     const passEncrypted = typeof b.pass === 'string' && b.pass.length > 0 ? encrypt(b.pass) : existing?.passEncrypted || '';
     if (!passEncrypted) throw bad('Enter the mailbox password');
+    const bouncesOnly = b.bouncesOnly === true || b.bouncesOnly === 'true';
     const secure = b.secure === undefined ? port === 993 : b.secure === true || b.secure === 'true';
 
     await testImap({ host, port, secure, user, passEncrypted });
@@ -53,10 +55,10 @@ export function imapRouter({ settingsWrite, imapCheck } = {}) {
     // New details mean a new starting point: only mail that arrives from now on is read.
     const saved = await ImapSettings.findOneAndUpdate(
       { userId: req.userId },
-      { host, port, secure, user, passEncrypted, enabled: true, uidValidity: null, lastUid: null, nextCheckAt: new Date(), leaseUntil: null, lastError: '', errorCount: 0 },
+      { host, port, secure, user, passEncrypted, bouncesOnly, enabled: true, uidValidity: null, lastUid: null, nextCheckAt: new Date(), leaseUntil: null, lastError: '', errorCount: 0 },
       { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
-    await record({ ...fromReq(req), action: 'imap.saved', detail: `${host}:${port}, user ${user}, password ${typeof b.pass === 'string' && b.pass.length > 0 ? 'changed' : 'unchanged'}` });
+    await record({ ...fromReq(req), action: 'imap.saved', detail: `${host}:${port}, user ${user}${bouncesOnly ? ', bounces only' : ''}, password ${typeof b.pass === 'string' && b.pass.length > 0 ? 'changed' : 'unchanged'}` });
     res.json({ ok: true, settings: view(saved) });
   });
 
@@ -78,7 +80,7 @@ export function imapRouter({ settingsWrite, imapCheck } = {}) {
     if (!out) throw bad('Save your IMAP details first', 404);
     if (out.busy) return res.json({ ok: true, busy: true, stored: 0 });
     if (out.error) throw bad(out.error, 422); // the details are saved but the mailbox cannot be read: the owner can fix it
-    res.json({ ok: true, stored: out.stored, optOuts: out.optOuts });
+    res.json({ ok: true, stored: out.stored, optOuts: out.optOuts, bounces: out.bounces });
   });
 
   router.delete('/', ...use(settingsWrite), async (req, res) => {
