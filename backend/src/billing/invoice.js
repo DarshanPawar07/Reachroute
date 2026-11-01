@@ -58,6 +58,7 @@ export async function createInvoice(sub, { paymentId = '', amountPaise = sub.amo
       periodStart: sub.currentStart,
       periodEnd: sub.currentEnd,
       paymentId,
+      method: sub.manual ? 'upi' : 'razorpay',
       gstRate: inv.gstRate,
       totalPaise: amountPaise,
       ...tax,

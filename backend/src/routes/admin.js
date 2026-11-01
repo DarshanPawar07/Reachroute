@@ -2,11 +2,13 @@ import { Router } from 'express';
 import {
   accountDetail, createPlan, deletePlan, forceLogout, isPlanKey, listPlans, listUsers, markVerified, overview, setUserLimits, setUserPlan, suspendUser, unsuspendUser, updatePlan,
 } from '../admin/accounts.js';
-import { billingSummary, issueCreditNote, listInvoices, listSubscriptions } from '../admin/billing.js';
+import { billingSummary, issueCreditNote, listInvoices, listSubscriptions, listUpiRequests } from '../admin/billing.js';
+import { confirmUpiPayment, rejectUpiPayment } from '../billing/service.js';
+
 import { describeLimits } from '../plans/definitions.js';
 import { fromReq, listAudit, record } from '../audit/audit.js';
 import { requireAdmin } from '../middleware/auth.js';
-import { ContactMessage } from '../models.js';
+import { ContactMessage, User } from '../models.js';
 import { bad, validId } from '../utils/http.js';
 import { logger } from '../utils/logger.js';
 
@@ -104,6 +106,26 @@ export function adminRouter() {
   router.get('/billing/summary', async (_req, res) => res.json(await billingSummary()));
   router.get('/billing/subscriptions', async (req, res) => res.json(await listSubscriptions(req.query)));
   router.get('/billing/invoices', async (req, res) => res.json(await listInvoices(req.query)));
+  router.get('/billing/upi-requests', async (req, res) => res.json(await listUpiRequests(req.query)));
+  router.post('/billing/upi-requests/:id/confirm', async (req, res) => {
+    const b = req.body || {};
+    for (const v of [b.note, b.utr]) if (v !== undefined && typeof v !== 'string') throw bad('Send text');
+    if (b.utr && !/^\d{12}$/.test(b.utr.trim())) throw bad('A UPI transaction id has 12 digits');
+    const r = await confirmUpiPayment(req.params.id, { by: req.adminEmail, note: b.note, utr: b.utr });
+    if (!r) throw bad('This request was already decided, or does not exist.', 409);
+    const email = (await User.findById(r.request.userId).select('email').lean())?.email;
+    await record({ ...fromReq(req), actorEmail: req.adminEmail, action: 'billing.upi_confirmed', targetId: r.request.userId, targetEmail: email, detail: `${r.request.reference} ${r.request.planKey} ${r.request.interval} Rs ${r.request.amountPaise / 100} utr ${r.request.utr}`.slice(0, 500) });
+    res.json({ ok: true, invoice: r.invoice?.number });
+  });
+  router.post('/billing/upi-requests/:id/reject', async (req, res) => {
+    const note = req.body?.note;
+    if (typeof note !== 'string' || !note.trim()) throw bad('Say why, so the customer knows what to do');
+    const r = await rejectUpiPayment(req.params.id, { by: req.adminEmail, note: note.trim() });
+    if (!r) throw bad('This request was already decided, or does not exist.', 409);
+    const email = (await User.findById(r.userId).select('email').lean())?.email;
+    await record({ ...fromReq(req), actorEmail: req.adminEmail, action: 'billing.upi_rejected', targetId: r.userId, targetEmail: email, detail: `${r.reference} | ${note.trim()}`.slice(0, 500) });
+    res.json({ ok: true });
+  });
   router.post('/billing/invoices/:id/refund-note', async (req, res) => {
     const result = await issueCreditNote(req.params.id, req.body || {}, req.adminEmail);
     log.info({ admin: req.userId, invoice: req.params.id, note: result.note.number }, 'refund note issued');

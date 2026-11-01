@@ -5,7 +5,8 @@ import { fromReq, record } from '../audit/audit.js';
 import { applyRemote, endSubscription, handleWebhookEvent, settlePayment } from '../billing/service.js';
 import { cancelSubscription, createSubscription, ensureRazorpayPlan, fetchSubscription, razorpayEnabled, toPaise, verifyPaymentSignature, verifyWebhookSignature } from '../billing/razorpay.js';
 import { config } from '../config.js';
-import { Invoice, Plan, Subscription, User } from '../models.js';
+import crypto from 'node:crypto';
+import { Invoice, PaymentRequest, Plan, Subscription, User } from '../models.js';
 import { platformLimits, onlyLimits } from '../plans/definitions.js';
 import { resolveLimits } from '../plans/limits.js';
 import { quotaSummary } from '../plans/quota.js';
@@ -35,7 +36,7 @@ export function publicPlansRouter() {
 }
 
 const currentSub = (userId) => Subscription.findOne({ userId, endedAt: null, status: { $in: LIVE } }).sort({ createdAt: -1 });
-const subView = (s) => s && { planKey: s.planKey, interval: s.interval, status: s.status, currentEnd: s.currentEnd, cancelAtCycleEnd: s.cancelAtCycleEnd, amount: s.amount / 100 };
+const subView = (s) => s && { manual: Boolean(s.manual), planKey: s.planKey, interval: s.interval, status: s.status, currentEnd: s.currentEnd, cancelAtCycleEnd: s.cancelAtCycleEnd, amount: s.amount / 100 };
 
 async function status(userId) {
   const [plans, sub, resolved, usage, me] = await Promise.all([
@@ -45,7 +46,7 @@ async function status(userId) {
     quotaSummary(userId),
     User.findById(userId).select('billing').lean(),
   ]);
-  return { profile: { name: me?.billing?.name || '', address: me?.billing?.address || '', state: me?.billing?.state || '', gstin: me?.billing?.gstin || '' }, gst: config.invoice.gstRate > 0, enabled: razorpayEnabled(), keyId: razorpayEnabled() ? config.razorpay.keyId : null, plans: plans.map(publicPlan), current: resolved.plan, subscription: subView(sub), usage };
+  return { profile: { name: me?.billing?.name || '', address: me?.billing?.address || '', state: me?.billing?.state || '', gstin: me?.billing?.gstin || '' }, gst: config.invoice.gstRate > 0, upi: config.upi.id ? { id: config.upi.id, name: config.upi.name } : null, enabled: razorpayEnabled(), keyId: razorpayEnabled() ? config.razorpay.keyId : null, plans: plans.map(publicPlan), current: resolved.plan, subscription: subView(sub), usage };
 }
 
 export function billingRouter() {
@@ -117,15 +118,72 @@ export function billingRouter() {
         id: i._id, number: i.number, issuedAt: i.issuedAt, title: i.seller?.gstin && i.gstRate > 0 ? 'Tax invoice' : 'Invoice',
         planName: i.planName, interval: i.interval, periodStart: i.periodStart, periodEnd: i.periodEnd, paymentId: i.paymentId, gstRate: i.gstRate,
         total: rupee(i.totalPaise), taxable: rupee(i.taxablePaise), cgst: rupee(i.cgstPaise), sgst: rupee(i.sgstPaise), igst: rupee(i.igstPaise),
-        seller: i.seller, buyer: i.buyer,
+        method: i.method || 'razorpay', seller: i.seller, buyer: i.buyer,
         creditNotes: (i.creditNotes || []).map((c) => ({ number: c.number, amount: c.amountPaise / 100, reason: c.reason, issuedAt: c.issuedAt })),
       },
     });
   });
 
+  // ---- paying by UPI by hand: ask, pay, say you paid, an administrator confirms
+  const requestView = (r) => r && { id: r._id, planKey: r.planKey, interval: r.interval, amount: r.amountPaise / 100, reference: r.reference, utr: r.utr, status: r.status, decisionNote: r.decisionNote, createdAt: r.createdAt };
+  const upiOn = () => {
+    if (!config.upi.id) throw bad('Paying by UPI is not switched on.', 503);
+  };
+
+  router.get('/upi', async (req, res) => {
+    const rows = await PaymentRequest.find({ userId: req.userId }).sort({ createdAt: -1 }).limit(5).lean();
+    res.json({ upi: config.upi.id ? { id: config.upi.id, name: config.upi.name } : null, requests: rows.map(requestView) });
+  });
+
+  router.post('/upi/request', async (req, res) => {
+    upiOn();
+    const { planKey, interval } = req.body || {};
+    if (!INTERVALS.includes(interval)) throw bad('Choose monthly or yearly billing.');
+    const plan = await Plan.findOne({ key: String(planKey || '').toLowerCase(), listed: { $ne: false } }).lean();
+    if (!plan) throw bad('That plan is not available.', 404);
+    const rupees = interval === 'year' ? plan.priceYearly : plan.priceMonthly;
+    if (!(rupees >= 1)) throw bad('That plan cannot be bought online.');
+    // one open request at a time: asking again replaces the old one
+    await PaymentRequest.updateMany({ userId: req.userId, status: 'pending' }, { $set: { status: 'cancelled' } });
+    if (await PaymentRequest.exists({ userId: req.userId, status: 'submitted' })) throw bad('You already have a payment waiting to be confirmed. We will confirm it soon.', 409);
+    let created;
+    for (let i = 0; i < 5 && !created; i++) {
+      try {
+        created = await PaymentRequest.create({ userId: req.userId, planKey: plan.key, interval, amountPaise: toPaise(rupees), reference: `RR-${crypto.randomBytes(3).toString('hex').toUpperCase()}` });
+      } catch (err) {
+        if (err.code !== 11000) throw err;
+      }
+    }
+    if (!created) throw bad('Could not make a payment reference. Try again.', 500);
+    await record({ ...fromReq(req), action: 'billing.upi_requested', detail: `${plan.key} ${interval} ${created.reference}` });
+    res.status(201).json({ request: requestView(created), upi: { id: config.upi.id, name: config.upi.name } });
+  });
+
+  router.post('/upi/:id/paid', async (req, res) => {
+    upiOn();
+    if (!mongoose.isValidObjectId(req.params.id)) throw bad('Not found', 404);
+    const utr = String(req.body?.utr ?? '').replace(/\s+/g, '');
+    if (!/^\d{12}$/.test(utr)) throw bad('The UPI transaction id has 12 digits. Find it in your UPI app under the payment details.');
+    if (await PaymentRequest.exists({ utr, status: { $in: ['submitted', 'confirmed'] } })) throw bad('That transaction id was already used for a payment.', 409);
+    const r = await PaymentRequest.findOneAndUpdate({ _id: req.params.id, userId: req.userId, status: 'pending' }, { $set: { status: 'submitted', utr, submittedAt: new Date() } }, { returnDocument: 'after' }).lean();
+    if (!r) throw bad('This request is no longer open. Start a new one.', 404);
+    await record({ ...fromReq(req), action: 'billing.upi_paid', detail: `${r.reference} utr ${utr}` });
+    res.json({ request: requestView(r) });
+  });
+
+  router.post('/upi/:id/cancel', async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) throw bad('Not found', 404);
+    await PaymentRequest.updateOne({ _id: req.params.id, userId: req.userId, status: 'pending' }, { $set: { status: 'cancelled' } });
+    res.json({ ok: true });
+  });
+
   router.post('/cancel', async (req, res) => {
     const sub = await currentSub(req.userId);
     if (!sub) throw bad('You have no paid subscription to cancel.', 404);
+    if (sub.manual) {
+      // paid by UPI: it never renews by itself, so there is nothing to stop. The plan simply ends on its date.
+      return res.json(await status(req.userId));
+    }
     const atEnd = sub.status === 'active' && sub.paidCount > 0;
     await cancelSubscription(sub.razorpaySubscriptionId, atEnd);
     if (atEnd) {

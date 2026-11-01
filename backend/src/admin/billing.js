@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { financialYear } from '../billing/invoice.js';
-import { Counter, Invoice, Subscription, User } from '../models.js';
+import { Counter, Invoice, PaymentRequest, Subscription, User } from '../models.js';
 import { bad } from '../utils/http.js';
 
 /** What an administrator sees of payments: who pays, what was invoiced, and refund notes. Card details never reach us. */
@@ -34,6 +34,7 @@ export async function billingSummary() {
   const collected = subs.reduce((sum, i) => sum + i.totalPaise, 0);
   const refunded = subs.reduce((sum, i) => sum + refundedPaise(i), 0);
   return {
+    waitingUpi: await PaymentRequest.countDocuments({ status: 'submitted' }),
     payingAccounts: live.length,
     renewingAccounts: live.filter((s) => !s.cancelAtCycleEnd).length,
     monthlyRecurring: Math.round(monthly) / 100, // rupees a month that will keep coming if nobody cancels
@@ -131,4 +132,27 @@ export async function issueCreditNote(invoiceId, { amount, reason } = {}, adminE
   ).lean();
   if (!updated) throw bad('This invoice was refunded just now. Reload and check what is left.', 409);
   return { invoice: invoiceRow(updated), note, email: inv.buyer?.email || '', userId: inv.userId };
+}
+
+const REQUEST_STATUSES = new Set(['', 'open', 'pending', 'submitted', 'confirmed', 'rejected', 'cancelled']);
+
+/** UPI payments waiting to be checked (default), or any status. */
+export async function listUpiRequests(query = {}) {
+  const status = one('status', query.status) || 'open';
+  if (!REQUEST_STATUSES.has(status)) throw bad('That status is not one of the request statuses');
+  const { size, pageNo } = paging(query);
+  const filter = status === 'open' ? { status: 'submitted' } : { status };
+  const [total, rows] = await Promise.all([
+    PaymentRequest.countDocuments(filter).maxTimeMS(5000),
+    PaymentRequest.find(filter).sort({ createdAt: status === 'open' ? 1 : -1 }).skip((pageNo - 1) * size).limit(size).maxTimeMS(5000).lean(),
+  ]);
+  const users = await User.find({ _id: { $in: rows.map((r) => r.userId) } }).select('email').lean();
+  const email = new Map(users.map((u) => [String(u._id), u.email]));
+  return {
+    requests: rows.map((r) => ({
+      id: r._id, userId: r.userId, email: email.get(String(r.userId)) || '(deleted account)', planKey: r.planKey, interval: r.interval, amount: r.amountPaise / 100,
+      reference: r.reference, utr: r.utr, status: r.status, createdAt: r.createdAt, submittedAt: r.submittedAt, decidedBy: r.decidedBy, decisionNote: r.decisionNote,
+    })),
+    total, page: pageNo, pages: Math.max(1, Math.ceil(total / size)),
+  };
 }

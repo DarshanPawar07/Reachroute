@@ -98,6 +98,11 @@ export const config = {
     keySecret: process.env.RAZORPAY_KEY_SECRET || '',
     webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || '',
   },
+  // Paying by UPI by hand (no payment company): the customer pays this UPI ID, you confirm it in Admin > Billing. Off when UPI_ID is empty.
+  upi: {
+    id: (process.env.UPI_ID || '').trim(),
+    name: process.env.UPI_PAYEE_NAME || process.env.INVOICE_SELLER_NAME || process.env.LEGAL_OPERATOR_NAME || 'Reachroute',
+  },
   // The invoice a customer gets after each payment. With GST_RATE=0 (not registered for GST) it is a plain invoice without tax.
   // Prices are treated as GST-INCLUSIVE: with GST_RATE=18 a Rs 699 payment is shown as 592.37 + 106.63 GST. Ask your CA for the rate, the SAC code and the place-of-supply rules.
   invoice: {

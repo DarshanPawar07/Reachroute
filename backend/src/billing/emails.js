@@ -26,8 +26,13 @@ export const emailPaymentFailed = (userId, { planName, halted }) =>
     ? `Payments for your ${planName} plan failed several times, so the subscription is on hold. Subscribe again to keep your limits:\n${config.appUrl}/billing`
     : `We could not take the payment for your ${planName} plan. Razorpay will try again. Please make sure your card, UPI or bank mandate is ready.\n${config.appUrl}/billing`);
 
-export const emailPlanEnding = (userId, { planName, endsAt, cancelled }) =>
-  send(userId, `Your ${planName} plan ends on ${day(endsAt)}`, cancelled
+export const emailUpiRejected = (userId, { planName, amountPaise, reference, note }) =>
+  send(userId, `We could not confirm your ${planName} payment`, `We could not match a UPI payment of ${rupees(amountPaise)} to your request ${reference}.${note ? `\n\nNote from us: ${note}` : ''}\n\nIf you did pay, reply to this email with the transaction id and a screenshot, or send the request again:\n${config.appUrl}/billing`);
+
+export const emailPlanEnding = (userId, { planName, endsAt, cancelled, manual }) =>
+  send(userId, `Your ${planName} plan ends on ${day(endsAt)}`, manual
+    ? `Your ${planName} plan is paid until ${day(endsAt)}. Pay again before then to keep your limits, and the time is added to the end of what you have:\n${config.appUrl}/billing`
+    : cancelled
     ? `You cancelled your ${planName} plan, so it ends on ${day(endsAt)} and your account then moves back to the free limits. Changed your mind? Subscribe again any time:\n${config.appUrl}/billing`
     : `The latest payment for your ${planName} plan has not gone through, and the plan ends on ${day(endsAt)} unless it does. Check your payment method:\n${config.appUrl}/billing`);
 

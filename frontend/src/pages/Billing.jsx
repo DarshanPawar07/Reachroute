@@ -35,6 +35,78 @@ function Meter({ label, used, cap }) {
   );
 }
 
+function copy(text) {
+  try {
+    navigator.clipboard?.writeText(text);
+  } catch {
+    /* the text is on screen to copy by hand */
+  }
+}
+
+/** Paying by UPI by hand: pay the UPI ID, give the transaction id, an administrator confirms. */
+function UpiPanel({ request, upi, planName, onChange, onNote }) {
+  const [utr, setUtr] = useState('');
+  const [busy, setBusy] = useState('');
+  const r = request;
+  const link = `upi://pay?pa=${encodeURIComponent(upi.id)}&pn=${encodeURIComponent(upi.name)}&am=${r.amount}&cu=INR&tn=${encodeURIComponent(r.reference)}`;
+  const run = async (what, fn) => {
+    setBusy(what);
+    try {
+      await fn();
+    } catch (e) {
+      onNote({ kind: 'error', text: e.message });
+    } finally {
+      setBusy('');
+    }
+  };
+  const paid = (e) => {
+    e.preventDefault();
+    run('paid', async () => {
+      await api(`/api/billing/upi/${r.id}/paid`, { method: 'POST', body: { utr } });
+      onNote({ kind: 'success', text: 'Thank you. We will check the payment and confirm it, usually within a day. You will get an email.' });
+      onChange();
+    });
+  };
+  const cancel = () => run('cancel', async () => {
+    await api(`/api/billing/upi/${r.id}/cancel`, { method: 'POST' });
+    onChange();
+  });
+  if (r.status === 'submitted') {
+    return (
+      <Card className="space-y-2 border-emerald-600">
+        <h2 className="text-lg font-semibold">Waiting for confirmation</h2>
+        <p className="text-sm text-stone-700">We received your payment details for the {planName} plan ({rupees(r.amount)}, reference {r.reference}, transaction {r.utr}). We check each payment against our bank and then switch your plan on. You will get an email.</p>
+      </Card>
+    );
+  }
+  return (
+    <Card className="space-y-4 border-emerald-600">
+      <div>
+        <h2 className="text-lg font-semibold">Pay {rupees(r.amount)} for the {planName} plan by UPI</h2>
+        <p className="text-sm text-stone-600">Pay from any UPI app, then tell us the transaction id. We confirm it by hand, so the plan starts once we have checked the payment.</p>
+      </div>
+      <div className="grid gap-5 sm:grid-cols-[auto_1fr]">
+        <img src="/upi-qr.png" alt="UPI QR code" className="mx-auto h-48 w-auto rounded-xl border border-stone-200" onError={(e) => { e.currentTarget.style.display = 'none'; }} />
+        <dl className="space-y-3 text-sm">
+          <div><dt className="text-stone-500">Pay to (UPI ID)</dt><dd className="flex flex-wrap items-center gap-2 font-medium">{upi.id} <button type="button" onClick={() => copy(upi.id)} className="text-xs font-semibold text-emerald-700 underline">Copy</button></dd></div>
+          <div><dt className="text-stone-500">Amount</dt><dd className="font-medium">{rupees(r.amount)}</dd></div>
+          <div><dt className="text-stone-500">Write this in the payment note</dt><dd className="flex flex-wrap items-center gap-2 font-mono font-medium">{r.reference} <button type="button" onClick={() => copy(r.reference)} className="font-sans text-xs font-semibold text-emerald-700 underline">Copy</button></dd></div>
+          <a href={link} className="inline-block text-sm font-semibold text-emerald-700 underline">Open my UPI app (phone)</a>
+        </dl>
+      </div>
+      <form onSubmit={paid} className="grid gap-3 sm:grid-cols-[1fr_auto]">
+        <Field label="UPI transaction id (12 digits)" hint="Find it in your UPI app under the payment details. It may be called UTR or reference number.">
+          <Input inputMode="numeric" maxLength={14} value={utr} onChange={(e) => setUtr(e.target.value)} placeholder="123456789012" required />
+        </Field>
+        <div className="flex items-end gap-2">
+          <Button type="submit" variant="accent" disabled={busy === 'paid'}>{busy === 'paid' ? 'Sending...' : 'I have paid'}</Button>
+          <Button variant="secondary" onClick={cancel} disabled={busy === 'cancel'}>Cancel</Button>
+        </div>
+      </form>
+    </Card>
+  );
+}
+
 /** The few numbers that tell plans apart, from what the server says right now. */
 function facts(l) {
   const out = [];
@@ -151,6 +223,7 @@ export default function Billing() {
   const [interval, setInterval_] = useState('month');
   const [busy, setBusy] = useState('');
   const [note, setNote] = useState(null);
+  const [upiReqs, setUpiReqs] = useState([]);
   const wanted = params.get('plan');
 
   const load = useCallback(async () => {
@@ -158,6 +231,7 @@ export default function Billing() {
       const [d, inv] = await Promise.all([api('/api/billing'), api('/api/billing/invoices').catch(() => ({ invoices: [] }))]);
       setData(d);
       setInvoices(inv.invoices);
+      if (d.upi) setUpiReqs((await api('/api/billing/upi').catch(() => ({ requests: [] }))).requests);
     } catch (e) {
       setNote({ kind: 'error', text: e.message });
     }
@@ -201,6 +275,20 @@ export default function Billing() {
     }
   };
 
+  const startUpi = async (plan) => {
+    setBusy(plan.key);
+    setNote(null);
+    try {
+      await api('/api/billing/upi/request', { method: 'POST', body: { planKey: plan.key, interval } });
+      await load();
+      setTimeout(() => document.getElementById('upi-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+    } catch (e) {
+      setNote({ kind: 'error', text: e.message });
+    } finally {
+      setBusy('');
+    }
+  };
+
   const cancel = async () => {
     if (!await askConfirm('You keep your plan until the end of the period you paid for, and it will not renew after that.', { title: 'Cancel your subscription?', confirmLabel: 'Cancel subscription', cancelLabel: 'Keep my plan', danger: true })) return;
     setBusy('cancel');
@@ -228,7 +316,18 @@ export default function Billing() {
       <PageHeader title="Plan and billing" subtitle={`You are on the ${data.current.name} plan.`} />
       <div className="space-y-5">
         {note && <Alert kind={note.kind}>{note.text}</Alert>}
-        {!data.enabled && <Alert kind="info">Online payments are not switched on yet. <Link to="/contact?topic=plans" className="font-semibold underline">Write to us</Link> to get a paid plan.</Alert>}
+        {!data.enabled && !data.upi && <Alert kind="info">Online payments are not switched on yet. <Link to="/contact?topic=plans" className="font-semibold underline">Write to us</Link> to get a paid plan.</Alert>}
+
+        {data.upi && (() => {
+          const open = upiReqs.find((q) => q.status === 'pending' || q.status === 'submitted');
+          const last = upiReqs[0];
+          return (
+            <div id="upi-panel" className="space-y-3">
+              {open && <UpiPanel key={open.id + open.status} request={open} upi={data.upi} planName={data.plans.find((p) => p.key === open.planKey)?.name || open.planKey} onChange={load} onNote={setNote} />}
+              {!open && last?.status === 'rejected' && <Alert kind="error">We could not confirm your last UPI payment ({last.reference}). {last.decisionNote} Start a new request below, or write to us.</Alert>}
+            </div>
+          );
+        })()}
 
         <Card className="space-y-4">
           <h2 className="text-lg font-semibold">What you have used</h2>
@@ -244,7 +343,9 @@ export default function Billing() {
             <h2 className="text-lg font-semibold">Your subscription</h2>
             <p className="text-sm text-stone-700">
               {data.plans.find((p) => p.key === sub.planKey)?.name || sub.planKey}, {rupees(sub.amount)} {sub.interval === 'year' ? 'a year' : 'a month'}.{' '}
-              {sub.status === 'halted' || sub.status === 'pending'
+              {sub.manual
+                ? `Paid by UPI until ${date(sub.currentEnd)}. To keep it, pay again before then and the time is added.`
+                : sub.status === 'halted' || sub.status === 'pending'
                 ? 'The last payment did not go through. Check your card or UPI, or subscribe again below.'
                 : sub.cancelAtCycleEnd
                   ? `Cancelled. You keep the plan until ${date(sub.currentEnd)}.`
@@ -252,7 +353,7 @@ export default function Billing() {
                     ? `Renews on ${date(sub.currentEnd)}.`
                     : ''}
             </p>
-            {!sub.cancelAtCycleEnd && (
+            {!sub.cancelAtCycleEnd && !sub.manual && (
               <Button variant="danger" onClick={cancel} disabled={busy === 'cancel'}>
                 {busy === 'cancel' ? 'Cancelling...' : 'Cancel subscription'}
               </Button>
@@ -278,7 +379,8 @@ export default function Billing() {
             const price = interval === 'year' ? p.priceYearly : p.priceMonthly;
             const isFree = !(p.priceMonthly > 0 || p.priceYearly > 0);
             const current = data.current.key === p.key;
-            const same = sub && sub.planKey === p.key && sub.interval === interval && !sub.cancelAtCycleEnd;
+            const same = sub && !sub.manual && sub.planKey === p.key && sub.interval === interval && !sub.cancelAtCycleEnd;
+            const renew = sub?.manual && sub.planKey === p.key;
             return (
               <Card key={p.key} className={`flex flex-col ${wanted === p.key ? 'ring-4 ring-emerald-600/20' : ''} ${current ? 'border-emerald-600' : ''}`}>
                 <h3 className="text-lg font-semibold">{p.name}{current && <span className="ml-2 text-xs font-medium text-emerald-700">your plan</span>}</h3>
@@ -297,8 +399,8 @@ export default function Billing() {
                   {isFree ? (
                     <p className="text-sm text-stone-500">Every new account starts here.</p>
                   ) : (
-                    <Button variant={wanted === p.key ? 'accent' : 'secondary'} className="w-full" disabled={!data.enabled || busy === p.key || same || price <= 0} onClick={() => subscribe(p)}>
-                      {busy === p.key ? 'Opening payment...' : same ? 'Current plan' : `Choose ${p.name}`}
+                    <Button variant={wanted === p.key ? 'accent' : 'secondary'} className="w-full" disabled={(!data.enabled && !data.upi) || busy === p.key || same || price <= 0} onClick={() => (data.enabled ? subscribe(p) : startUpi(p))}>
+                      {busy === p.key ? 'Opening payment...' : same ? 'Current plan' : data.enabled ? `Choose ${p.name}` : renew ? `Renew ${p.name} by UPI` : `Pay for ${p.name} by UPI`}
                     </Button>
                   )}
                 </div>
@@ -332,7 +434,7 @@ export default function Billing() {
         <BillingDetails initial={data.profile} />
 
         <p className="text-sm text-stone-500">
-          Payments go through Razorpay (UPI, cards, net banking) and renew automatically until you cancel. If you move to a different plan, the old subscription stops straight away. Read the <a href={`${API_BASE}/legal/refunds`} target="_blank" rel="noreferrer" className="font-semibold text-emerald-700 underline">refund and cancellation policy</a>. Need more than Premium? <Link to="/contact?topic=plans&plan=business" className="font-semibold text-emerald-700 underline">Ask about Business</Link>.
+          {data.enabled ? 'Payments go through Razorpay (UPI, cards, net banking) and renew automatically until you cancel.' : 'You pay by UPI and we confirm the payment by hand. The plan does not renew by itself: pay again before it ends.'} If you move to a different plan, the old subscription stops straight away. Read the <a href={`${API_BASE}/legal/refunds`} target="_blank" rel="noreferrer" className="font-semibold text-emerald-700 underline">refund and cancellation policy</a>. Need more than Premium? <Link to="/contact?topic=plans&plan=business" className="font-semibold text-emerald-700 underline">Ask about Business</Link>.
         </p>
       </div>
     </>

@@ -397,6 +397,7 @@ const subscriptionSchema = new Schema(
     lastPaymentId: { type: String, default: '' },
     endedAt: { type: Date, default: null }, // set once the account has been moved off the plan
     reminderFor: { type: Date, default: null }, // the period end we already sent a "your plan is ending" email for
+    manual: { type: Boolean, default: false }, // paid by UPI and confirmed by an administrator: no Razorpay, does not renew by itself
   },
   { timestamps: true }
 );
@@ -609,6 +610,7 @@ const invoiceSchema = new Schema(
     cgstPaise: { type: Number, default: 0 },
     sgstPaise: { type: Number, default: 0 },
     igstPaise: { type: Number, default: 0 },
+    method: { type: String, default: 'razorpay' }, // razorpay | upi
     seller: { type: Schema.Types.Mixed },
     buyer: { type: Schema.Types.Mixed },
     // Refund notes (credit notes) an administrator issued against this payment. The money itself is returned in the Razorpay dashboard.
@@ -621,6 +623,30 @@ const invoiceSchema = new Schema(
 );
 invoiceSchema.index({ userId: 1, issuedAt: -1 });
 export const Invoice = mongoose.model('Invoice', invoiceSchema);
+
+// A customer says "I paid this much by UPI" and an administrator checks it against the bank and confirms.
+const paymentRequestSchema = new Schema(
+  {
+    userId: ref('User'),
+    planKey: { type: String, required: true },
+    interval: { type: String, enum: ['month', 'year'], required: true },
+    amountPaise: { type: Number, required: true }, // the price when the request was made
+    reference: { type: String, required: true, unique: true }, // short code the customer puts in the payment note
+    utr: { type: String, default: '' }, // the 12-digit UPI transaction id the customer gives
+    status: { type: String, enum: ['pending', 'submitted', 'confirmed', 'rejected', 'cancelled'], default: 'pending' },
+    submittedAt: { type: Date, default: null },
+    decidedAt: { type: Date, default: null },
+    decidedBy: { type: String, default: '' },
+    decisionNote: { type: String, default: '' },
+    subscriptionId: { type: Schema.Types.ObjectId, default: null },
+  },
+  { timestamps: true }
+);
+paymentRequestSchema.index({ userId: 1, createdAt: -1 });
+paymentRequestSchema.index({ status: 1, createdAt: -1 });
+// One transaction id can pay for one request only. (A rejected request gives its id back: it is kept in the decision note.)
+paymentRequestSchema.index({ utr: 1 }, { unique: true, partialFilterExpression: { utr: { $gt: '' } } });
+export const PaymentRequest = mongoose.model('PaymentRequest', paymentRequestSchema);
 
 // Running numbers (invoice numbers restart every financial year).
 const counterSchema = new Schema({ _id: { type: String }, seq: { type: Number, default: 0 } });

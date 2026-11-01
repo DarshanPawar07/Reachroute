@@ -59,7 +59,7 @@ export default function Invoice() {
           <Party title="Billed to" p={inv.buyer} />
           <div className="text-sm text-stone-700 sm:text-right">
             {inv.paymentId && <p>Payment reference: {inv.paymentId}</p>}
-            <p>Paid through Razorpay</p>
+            <p>{inv.method === 'upi' ? 'Paid by UPI' : 'Paid through Razorpay'}</p>
           </div>
         </section>
 

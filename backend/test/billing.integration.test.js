@@ -10,6 +10,8 @@ if (URI && !/test/i.test(URI)) throw new Error('TEST_MONGO_URI must contain "tes
 const skip = URI ? false : 'set TEST_MONGO_URI to a throw-away database to run these tests';
 process.env.SMTP_HOST = '';
 process.env.ALERT_EMAILS = 'false';
+process.env.UPI_ID = 'pay@testbank';
+process.env.UPI_PAYEE_NAME = 'Test Payee';
 process.env.RAZORPAY_KEY_ID = 'rzp_test_fake';
 process.env.RAZORPAY_KEY_SECRET = 'fake_secret';
 process.env.RAZORPAY_WEBHOOK_SECRET = 'fake_webhook_secret';
@@ -67,6 +69,7 @@ after(async () => {
     Plan.deleteMany({ key: { $in: planKeys } }),
     Subscription.deleteMany({ userId: { $in: ids } }),
     models.Invoice.deleteMany({ userId: { $in: ids } }),
+    models.PaymentRequest.deleteMany({ userId: { $in: ids } }),
     Recipient.deleteMany({ userId: { $in: ids } }),
     Campaign.deleteMany({ userId: { $in: ids } }),
     BillingEvent.deleteMany({ _id: new RegExp(`^${tag}`) }),
@@ -373,4 +376,73 @@ test('admin billing: lists subscriptions and invoices, and refund notes cannot e
   const audit = await call('GET', '/api/admin/audit?action=billing.refund_note', { token: admin.token });
   assert.ok(audit.body.entries.some((e) => e.target?.email === payer.email));
   await sub.deleteOne();
+});
+
+test('pay by UPI: ask, pay, say so, an administrator confirms; renewals add time; it never renews by itself', T, async () => {
+  const key = await makePlan('upi', { priceMonthly: 699, priceYearly: 6990 });
+  const admin = await newUser({ admin: true });
+  const u = await newUser();
+  const u2 = await newUser();
+  const ask = (user, interval = 'month') => call('POST', '/api/billing/upi/request', { token: user.token, json: { planKey: key, interval } });
+
+  assert.equal((await call('GET', '/api/billing', { token: u.token })).body.upi.id, 'pay@testbank');
+  assert.equal((await ask(u, 'weekly')).status, 400);
+  const first = await ask(u);
+  assert.equal(first.status, 201, say(first));
+  assert.match(first.body.request.reference, /^RR-[0-9A-F]{6}$/);
+  assert.equal(first.body.request.amount, 699);
+
+  // asking again replaces the unpaid request
+  const again = await ask(u);
+  assert.notEqual(again.body.request.id, first.body.request.id);
+  const id = again.body.request.id;
+
+  const paid = (user, rid, utr) => call('POST', `/api/billing/upi/${rid}/paid`, { token: user.token, json: { utr } });
+  assert.equal((await paid(u, id, '123')).status, 400);
+  assert.equal((await paid(u, id, '123456789012')).status, 200);
+  assert.equal((await ask(u)).status, 409); // one payment waiting at a time
+  const other = await ask(u2);
+  assert.equal((await paid(u2, other.body.request.id, '123456789012')).status, 409); // the same transaction id cannot pay twice
+
+  // only an administrator can see and decide
+  assert.equal((await call('GET', '/api/admin/billing/upi-requests', { token: u.token })).status, 403);
+  const open = await call('GET', '/api/admin/billing/upi-requests', { token: admin.token });
+  const mine = open.body.requests.find((r) => r.id === id);
+  assert.ok(mine && mine.email === u.email && mine.utr === '123456789012' && mine.amount === 699);
+
+  const calls = rzpCalls.length;
+  const ok = await call('POST', `/api/admin/billing/upi-requests/${id}/confirm`, { token: admin.token, json: {} });
+  assert.equal(ok.status, 200, say(ok));
+  assert.match(ok.body.invoice, /^[A-Z]+\/\d{4}-\d{2}\/\d{5}$/);
+  assert.equal((await call('POST', `/api/admin/billing/upi-requests/${id}/confirm`, { token: admin.token, json: {} })).status, 409); // double click
+  assert.equal(String((await User.findById(u.id).lean()).planKey), key);
+  const inv = (await call('GET', '/api/billing/invoices', { token: u.token })).body.invoices[0];
+  assert.equal((await call('GET', `/api/billing/invoices/${inv.id}`, { token: u.token })).body.invoice.method, 'upi');
+
+  // it is a plan paid for, with no renewal: nothing to cancel, and Razorpay is never asked
+  const state = (await call('GET', '/api/billing', { token: u.token })).body;
+  assert.equal(state.subscription.manual, true);
+  assert.equal((await call('POST', '/api/billing/cancel', { token: u.token })).status, 200);
+  assert.equal(rzpCalls.length, calls);
+
+  // paying the same plan again adds the new month after the old one
+  const before = await Subscription.findOne({ userId: u.id, manual: true, endedAt: null });
+  const r2 = await ask(u);
+  await paid(u, r2.body.request.id, '222222222222');
+  assert.equal((await call('POST', `/api/admin/billing/upi-requests/${r2.body.request.id}/confirm`, { token: admin.token, json: {} })).status, 200);
+  const after2 = await Subscription.findOne({ userId: u.id, manual: true, endedAt: null });
+  assert.equal(after2.currentStart.getTime(), before.currentEnd.getTime());
+  assert.ok(after2.currentEnd > before.currentEnd);
+
+  // a rejected payment tells the customer why
+  assert.equal((await call('POST', `/api/admin/billing/upi-requests/${other.body.request.id}/reject`, { token: admin.token, json: {} })).status, 400); // needs a reason
+  const rej = await call('POST', `/api/admin/billing/upi-requests/${other.body.request.id}/reject`, { token: admin.token, json: { note: 'No such payment' } });
+  assert.equal(rej.status, 200, say(rej));
+  assert.equal((await call('GET', '/api/billing/upi', { token: u2.token })).body.requests[0].status, 'rejected');
+  assert.equal(String((await User.findById(u2.id).lean()).planKey || ''), '');
+
+  // when the paid time is over the account goes back to the default plan
+  await Subscription.updateMany({ userId: u.id }, { $set: { currentEnd: new Date(Date.now() - 1000) } });
+  await runBillingExpiry();
+  assert.notEqual(String((await User.findById(u.id).lean()).planKey), key);
 });

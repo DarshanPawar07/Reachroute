@@ -99,6 +99,86 @@ function Subscriptions() {
   );
 }
 
+function UpiRequests({ onChanged }) {
+  const [status, setStatus] = useState('open');
+  const [page, setPage] = useState(1);
+  const [reason, setReason] = useState({});
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState('');
+  const { data, error, reload } = useList('/api/admin/billing/upi-requests', { status }, page);
+  const confirm = async (r) => {
+    if (!await askConfirm(`Open your UPI or bank app first. Is there a payment of ${rupees(r.amount)} with transaction id ${r.utr || '(none given)'} and note ${r.reference}? Confirming switches ${r.email} to ${r.planKey} for one ${r.interval === 'year' ? 'year' : 'month'} and emails them an invoice.`, { title: 'Confirm this payment?', confirmLabel: 'Payment received, confirm', cancelLabel: 'Go back' })) return;
+    setBusy(r.id);
+    setMsg(null);
+    try {
+      const out = await api(`/api/admin/billing/upi-requests/${r.id}/confirm`, { method: 'POST', body: {} });
+      setMsg({ kind: 'success', text: `Confirmed. Invoice ${out.invoice || ''} sent to ${r.email}.` });
+      reload();
+      onChanged();
+    } catch (e) {
+      setMsg({ kind: 'error', text: e.message });
+    } finally {
+      setBusy('');
+    }
+  };
+  const reject = async (r) => {
+    setBusy(r.id);
+    setMsg(null);
+    try {
+      await api(`/api/admin/billing/upi-requests/${r.id}/reject`, { method: 'POST', body: { note: reason[r.id] || '' } });
+      setMsg({ kind: 'success', text: `Rejected. ${r.email} has been emailed.` });
+      reload();
+      onChanged();
+    } catch (e) {
+      setMsg({ kind: 'error', text: e.message });
+    } finally {
+      setBusy('');
+    }
+  };
+  return (
+    <section className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-lg font-semibold">UPI payments to check</h2>
+        <div className="w-56"><Select value={status} onChange={(e) => { setStatus(e.target.value); setPage(1); }} aria-label="Show">
+          <option value="open">Waiting for me</option>
+          <option value="pending">Asked, not paid yet</option>
+          <option value="confirmed">Confirmed</option>
+          <option value="rejected">Rejected</option>
+          <option value="cancelled">Cancelled by customer</option>
+        </Select></div>
+      </div>
+      {msg && <Alert kind={msg.kind}>{msg.text}</Alert>}
+      {error && <Alert>{error}</Alert>}
+      {data && (
+        <Card>
+          <ul className="divide-y divide-stone-100">
+            {data.requests.map((r) => (
+              <li key={r.id} className="py-3 text-sm">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <Link to={`/admin/users/${r.userId}`} className="font-medium underline">{r.email}</Link>
+                    <div className="text-stone-700">{r.planKey}, {r.interval === 'year' ? 'yearly' : 'monthly'}, {rupees(r.amount)}</div>
+                    <div className="text-xs text-stone-500">Note <span className="font-mono">{r.reference}</span>{r.utr && <> · Transaction <span className="font-mono">{r.utr}</span></>} · {day(r.submittedAt || r.createdAt)}{r.decidedBy && <> · {r.status} by {r.decidedBy}</>}{r.decisionNote && <> · {r.decisionNote}</>}</div>
+                  </div>
+                  {r.status === 'submitted' && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button variant="accent" disabled={busy === r.id} onClick={() => confirm(r)}>Confirm payment</Button>
+                      <div className="w-48"><Input placeholder="Reason to reject" aria-label="Reason to reject" value={reason[r.id] || ''} onChange={(e) => setReason({ ...reason, [r.id]: e.target.value })} /></div>
+                      <Button variant="danger" disabled={busy === r.id || !(reason[r.id] || '').trim()} onClick={() => reject(r)}>Reject</Button>
+                    </div>
+                  )}
+                </div>
+              </li>
+            ))}
+            {data.requests.length === 0 && <li className="py-4 text-sm text-stone-500">Nothing here.</li>}
+          </ul>
+          <Pager data={data} page={page} setPage={setPage} />
+        </Card>
+      )}
+    </section>
+  );
+}
+
 function RefundForm({ invoice, onDone }) {
   const [amount, setAmount] = useState(String(invoice.refundable));
   const [reason, setReason] = useState('');
@@ -199,13 +279,15 @@ export default function AdminBilling() {
       <AdminTabs title="Billing" subtitle="Who is paying, what was invoiced, and refund notes." />
       <div className="space-y-6">
         {sum && (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+            <Stat label="UPI payments waiting" value={sum.waitingUpi} sub="to check and confirm" />
             <Stat label="Paying accounts" value={sum.payingAccounts} sub={`${sum.renewingAccounts} will renew`} />
             <Stat label="Coming in each month" value={rupees(sum.monthlyRecurring)} sub="if nobody cancels" />
             <Stat label="Collected so far" value={rupees(sum.collected)} sub={`${sum.invoices} invoices`} />
             <Stat label="Refund notes" value={rupees(sum.refunded)} sub="recorded here" />
           </div>
         )}
+        <UpiRequests onChanged={loadSummary} />
         <Subscriptions />
         <Invoices onChanged={loadSummary} />
       </div>

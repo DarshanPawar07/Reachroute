@@ -1,9 +1,9 @@
 import { config } from '../config.js';
-import { BillingEvent, Plan, Subscription, User } from '../models.js';
+import { BillingEvent, PaymentRequest, Plan, Subscription, User } from '../models.js';
 import { forgetLimits } from '../plans/limits.js';
 import { notify } from '../utils/notify.js';
 import { logger } from '../utils/logger.js';
-import { emailPaymentFailed, emailPaymentReceived, emailPlanEnded, emailPlanEnding } from './emails.js';
+import { emailPaymentFailed, emailPaymentReceived, emailPlanEnded, emailPlanEnding, emailUpiRejected } from './emails.js';
 import { createInvoice } from './invoice.js';
 import { cancelSubscription, fetchSubscription, razorpayEnabled } from './razorpay.js';
 
@@ -37,7 +37,7 @@ export async function grantPlan(sub) {
   const older = await Subscription.find({ userId: sub.userId, _id: { $ne: sub._id }, endedAt: null, status: { $in: LIVE } });
   for (const old of older) {
     try {
-      await cancelSubscription(old.razorpaySubscriptionId, false);
+      if (!old.manual) await cancelSubscription(old.razorpaySubscriptionId, false);
     } catch (err) {
       log.warn({ err: err.message, id: old.razorpaySubscriptionId }, 'could not stop the older subscription');
     }
@@ -106,6 +106,7 @@ export async function syncSubscriptions(now = new Date()) {
   if (!razorpayEnabled()) return 0;
   const subs = await Subscription.find({
     endedAt: null,
+    manual: { $ne: true }, // paid by UPI: Razorpay knows nothing about it
     $or: [
       { status: { $in: LIVE }, currentEnd: { $lt: new Date(now.getTime() + DAY) } },
       { status: 'created', createdAt: { $gte: new Date(now.getTime() - 3 * DAY) } },
@@ -136,14 +137,14 @@ export async function syncSubscriptions(now = new Date()) {
 /** Email a heads-up three days before a plan ends (cancelled, or a payment that is not going through). Once per period. */
 export async function sendEndingReminders(now = new Date()) {
   const soon = new Date(now.getTime() + 3 * DAY);
-  const subs = await Subscription.find({ endedAt: null, currentEnd: { $gt: now, $lte: soon }, $or: [{ cancelAtCycleEnd: true }, { status: { $in: ['pending', 'halted'] } }] }).limit(200);
+  const subs = await Subscription.find({ endedAt: null, currentEnd: { $gt: now, $lte: soon }, $or: [{ cancelAtCycleEnd: true }, { status: { $in: ['pending', 'halted'] } }] }).limit(200); // paid-by-UPI plans have cancelAtCycleEnd set, so they get the reminder too
   let sent = 0;
   for (const sub of subs) {
     if (sub.reminderFor && sub.reminderFor.getTime() === sub.currentEnd.getTime()) continue;
     sub.reminderFor = sub.currentEnd;
     await sub.save(); // marked first: a crash loses one email rather than sending many
     const plan = await Plan.findOne({ key: sub.planKey }).select('name').lean();
-    await emailPlanEnding(sub.userId, { planName: plan?.name || sub.planKey, endsAt: sub.currentEnd, cancelled: sub.cancelAtCycleEnd });
+    await emailPlanEnding(sub.userId, { planName: plan?.name || sub.planKey, endsAt: sub.currentEnd, cancelled: sub.cancelAtCycleEnd, manual: sub.manual });
     sent++;
   }
   return sent;
@@ -167,6 +168,45 @@ export function startBillingJob() {
     clearTimeout(first);
     clearInterval(timer);
   };
+}
+
+/**
+ * An administrator has checked the bank and the UPI payment really arrived: put the account on the plan, make the invoice, email it.
+ * Paying the same plan again before it ends adds the new period after the old one. Moving to a different plan starts it now.
+ * Safe against a double click: only the first call changes the request.
+ */
+export async function confirmUpiPayment(requestId, { by = '', note = '', utr = '' } = {}) {
+  const typed = String(utr || '').trim();
+  const claimed = await PaymentRequest.findOneAndUpdate(
+    { _id: requestId, status: { $in: ['pending', 'submitted'] } },
+    { $set: { status: 'confirmed', decidedAt: new Date(), decidedBy: by, decisionNote: String(note || '').slice(0, 300), ...(typed ? { utr: typed } : {}) } },
+    { returnDocument: 'after' }
+  );
+  if (!claimed) return null;
+  const now = new Date();
+  const same = await Subscription.findOne({ userId: claimed.userId, planKey: claimed.planKey, manual: true, endedAt: null, currentEnd: { $gt: now } }).sort({ currentEnd: -1 });
+  const start = same ? same.currentEnd : now;
+  const sub = await Subscription.create({
+    userId: claimed.userId, planKey: claimed.planKey, interval: claimed.interval, amount: claimed.amountPaise,
+    razorpaySubscriptionId: `upi_${claimed._id}`, razorpayPlanId: 'upi', status: 'active', paidCount: 1,
+    currentStart: start, currentEnd: addPeriod(start, claimed.interval), cancelAtCycleEnd: true, manual: true, lastPaymentId: claimed.utr || claimed.reference,
+  });
+  claimed.subscriptionId = sub._id;
+  await claimed.save();
+  const invoice = await settlePayment(sub, { paymentId: claimed.utr || claimed.reference });
+  return { request: claimed, subscription: sub, invoice };
+}
+
+export async function rejectUpiPayment(requestId, { by = '', note = '' } = {}) {
+  const r = await PaymentRequest.findOneAndUpdate(
+    { _id: requestId, status: { $in: ['pending', 'submitted'] } },
+    [{ $set: { status: 'rejected', decidedAt: new Date(), decidedBy: by, decisionNote: { $concat: [String(note || '').slice(0, 250), { $cond: [{ $gt: ['$utr', ''] }, { $concat: [' (transaction id ', '$utr', ')'] }, ''] }] }, utr: '' } }],
+    { returnDocument: 'after' }
+  );
+  if (!r) return null;
+  const plan = await Plan.findOne({ key: r.planKey }).select('name').lean();
+  await emailUpiRejected(r.userId, { planName: plan?.name || r.planKey, amountPaise: r.amountPaise, reference: r.reference, note: r.decisionNote });
+  return r;
 }
 
 const PLAN_LINK = '/billing';
