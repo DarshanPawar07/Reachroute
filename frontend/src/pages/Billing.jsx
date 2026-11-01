@@ -47,6 +47,7 @@ function copy(text) {
 function UpiPanel({ request, upi, planName, onChange, onNote }) {
   const [utr, setUtr] = useState('');
   const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
   const r = request;
   const link = `upi://pay?pa=${encodeURIComponent(upi.id)}&pn=${encodeURIComponent(upi.name)}&am=${r.amount}&cu=INR&tn=${encodeURIComponent(r.reference)}`;
   const run = async (what, fn) => {
@@ -54,15 +55,21 @@ function UpiPanel({ request, upi, planName, onChange, onNote }) {
     try {
       await fn();
     } catch (e) {
-      onNote({ kind: 'error', text: e.message });
+      setErr(e.message); // shown right here, next to the button that was pressed
     } finally {
       setBusy('');
     }
   };
   const paid = (e) => {
     e.preventDefault();
+    setErr('');
+    const digits = utr.replace(/\s+/g, '');
+    if (!/^\d{12}$/.test(digits)) {
+      setErr('That is not a valid transaction id. It has exactly 12 digits, with no letters. Find it in your UPI app under the payment details.');
+      return;
+    }
     run('paid', async () => {
-      await api(`/api/billing/upi/${r.id}/paid`, { method: 'POST', body: { utr } });
+      await api(`/api/billing/upi/${r.id}/paid`, { method: 'POST', body: { utr: digits } });
       onNote({ kind: 'success', text: 'Thank you. We will check the payment and confirm it, usually within a day. You will get an email.' });
       onChange();
     });
@@ -96,12 +103,13 @@ function UpiPanel({ request, upi, planName, onChange, onNote }) {
       </div>
       <form onSubmit={paid} className="grid gap-3 sm:grid-cols-[1fr_auto]">
         <Field label="UPI transaction id (12 digits)" hint="Find it in your UPI app under the payment details. It may be called UTR or reference number.">
-          <Input inputMode="numeric" maxLength={14} value={utr} onChange={(e) => setUtr(e.target.value)} placeholder="123456789012" required />
+          <Input inputMode="numeric" maxLength={14} value={utr} onChange={(e) => { setUtr(e.target.value); setErr(''); }} placeholder="123456789012" />
         </Field>
         <div className="flex items-end gap-2">
           <Button type="submit" variant="accent" disabled={busy === 'paid'}>{busy === 'paid' ? 'Sending...' : 'I have paid'}</Button>
           <Button variant="secondary" onClick={cancel} disabled={busy === 'cancel'}>Cancel</Button>
         </div>
+        {err && <div className="sm:col-span-2" role="alert"><Alert>{err}</Alert></div>}
       </form>
     </Card>
   );
